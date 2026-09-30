@@ -27,7 +27,20 @@
     @androidx.room.* <methods>;
     @androidx.room.* <fields>;
 }
--keepclassmembers @androidx.room.Entity class * { <fields>; }
+
+# Room 实体字段名即列名，禁止混淆/重命名字段
+-keepclassmembers @androidx.room.Entity class * {
+    <fields>;
+}
+
+# multiplatform-markdown-renderer（mikepenz）：保留其内部模型/解析类，避免 R8 裁剪 GFM 节点
+-keep class com.mikepenz.** { *; }
+-dontwarn com.mikepenz.**
+
+# 反注入自检依赖入口类名（entryMismatch），显式保留
+-keepnames class com.yunx.app.YunXApp
+-keepnames class com.yunx.app.MainActivity
+-keepnames class com.yunx.app.MainActivityIcon2
 
 # Uncomment this to preserve the line number information for
 # debugging stack traces.
