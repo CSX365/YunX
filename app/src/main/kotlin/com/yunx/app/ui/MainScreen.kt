@@ -104,6 +104,7 @@ import com.yunx.app.data.network.GitHubApi
 import com.yunx.app.data.network.GitHubTokenStore
 import com.yunx.app.data.network.Pan123Api
 import com.yunx.app.data.network.QuarkApi
+import com.yunx.app.data.network.TokenCheck
 import com.yunx.app.data.network.UCApi
 import com.yunx.app.data.network.XunleiApi
 import com.yunx.app.data.prefs.SettingsRepository
@@ -313,6 +314,16 @@ fun MainScreen() {
     }
     // 网盘页 GitHub 卡片登录态：保存/清除 Token 后即时刷新卡片主按钮文案
     var githubHasTokenState by remember { mutableStateOf(GitHubTokenStore.hasToken(context)) }
+    // 无效 Token 会被 GitHub 全量拒绝（401，连公开仓库解析也失败）：自动清除 Token、清空缓存并提示
+    LaunchedEffect(githubApi) {
+        githubApi.onUnauthorized = {
+            scope.launch {
+                GitHubTokenStore.setToken(context, null)
+                githubHasTokenState = false
+                SnackbarController.show("GitHub Token 无效或已过期，已自动清除并回退匿名限额，请重新配置")
+            }
+        }
+    }
     // GitHub Token 配置弹窗 / 清除二次确认
     var showGitHubTokenDialog by remember { mutableStateOf(false) }
     var showGitHubClearConfirm by remember { mutableStateOf(false) }
@@ -826,6 +837,9 @@ fun MainScreen() {
                                             if (!login.isNullOrBlank()) {
                                                 resolveViewModel.startResolve("https://github.com/$login", "")
                                                 currentTab = MainTab.Resolve
+                                            } else {
+                                                // 取不到 login：Token 无效/已过期，或网络异常
+                                                SnackbarController.show("无法获取 GitHub 账号信息，请检查网络或重新配置 Token")
                                             }
                                         }
                                     },
@@ -1048,93 +1062,119 @@ fun MainScreen() {
                 }
             )
         }
+    }
 
-        // GitHub Token 配置弹窗（网盘页入口）：Keystore 加密存储，输入用密码可见性切换
-        if (showGitHubTokenDialog) {
-            var tokenInput by rememberSaveable { mutableStateOf(GitHubTokenStore.getToken(context) ?: "") }
-            var passwordVisible by remember { mutableStateOf(false) }
-            AlertDialog(
-                onDismissRequest = { showGitHubTokenDialog = false },
-                title = { Text("GitHub Token") },
-                text = {
-                    Column {
-                        Text(
-                            text = "Token 仅用于提升 API 限额（匿名 60/小时，认证后 5000/小时）。经 Android Keystore AES-GCM 加密存储。",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        Spacer(Modifier.height(10.dp))
-                        Text(
-                            text = "如何获取 Token：",
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Text(
-                            text = "1. 电脑浏览器打开 GitHub，右上角头像 → Settings\n" +
-                                "2. 左侧 Developer settings → Personal access tokens → Tokens (classic) → Generate new token\n" +
-                                "3. 勾选 public_repo 即可浏览公开仓库；如需在主页看到自己的私有仓库，再勾选 repo\n" +
-                                "4. 有效期建议选 90 天或 No expiration，生成后复制粘贴到上方输入框",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            text = "安全提示：仅给最小权限，勿勾选删除/管理类权限；Token 不明文保存、不上传，清除只需清空后保存。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        OutlinedTextField(
-                            value = tokenInput,
-                            onValueChange = { tokenInput = it },
-                            singleLine = true,
-                            label = { Text("Personal Access Token") },
-                            visualTransformation = if (passwordVisible) VisualTransformation.None
-                            else PasswordVisualTransformation(),
-                            trailingIcon = {
-                                IconButton(onClick = { passwordVisible = !passwordVisible }) {
-                                    Icon(
-                                        if (passwordVisible) Icons.Outlined.Visibility
-                                        else Icons.Outlined.VisibilityOff,
-                                        contentDescription = if (passwordVisible) "隐藏" else "显示"
-                                    )
-                                }
+    // GitHub Token 配置弹窗（网盘页入口）：Keystore 加密存储，输入用密码可见性切换
+    // 注意：这两个弹窗与更新检查无关，必须在 latestRelease 为 null 时也能弹出
+    if (showGitHubTokenDialog) {
+        var tokenInput by rememberSaveable { mutableStateOf(GitHubTokenStore.getToken(context) ?: "") }
+        var passwordVisible by remember { mutableStateOf(false) }
+        // 校验失败提示（显示在输入框下方），修改输入即清除
+        var tokenError by remember { mutableStateOf<String?>(null) }
+        AlertDialog(
+            onDismissRequest = { showGitHubTokenDialog = false },
+            title = { Text("GitHub Token") },
+            text = {
+                Column {
+                    Text(
+                        text = "Token 仅用于提升 API 限额（匿名 60/小时，认证后 5000/小时）。经 Android Keystore AES-GCM 加密存储。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = "如何获取 Token：",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "1. 电脑浏览器打开 GitHub，右上角头像 → Settings\n" +
+                            "2. 左侧 Developer settings → Personal access tokens → Tokens (classic) → Generate new token\n" +
+                            "3. 勾选 public_repo 即可浏览公开仓库；如需在主页看到自己的私有仓库，再勾选 repo\n" +
+                            "4. 有效期建议选 90 天或 No expiration，生成后复制粘贴到上方输入框",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = "安全提示：仅给最小权限，勿勾选删除/管理类权限；Token 不明文保存、不上传，清除只需清空后保存。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = tokenInput,
+                        onValueChange = {
+                            tokenInput = it
+                            tokenError = null
+                        },
+                        singleLine = true,
+                        isError = tokenError != null,
+                        label = { Text("Personal Access Token") },
+                        supportingText = { tokenError?.let { Text(it) } },
+                        visualTransformation = if (passwordVisible) VisualTransformation.None
+                        else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                                Icon(
+                                    if (passwordVisible) Icons.Outlined.Visibility
+                                    else Icons.Outlined.VisibilityOff,
+                                    contentDescription = if (passwordVisible) "隐藏" else "显示"
+                                )
                             }
-                        )
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = {
-                        GitHubTokenStore.setToken(context, tokenInput.trim())
-                        githubHasTokenState = GitHubTokenStore.hasToken(context)
-                        showGitHubTokenDialog = false
-                        SnackbarController.show(if (tokenInput.isBlank()) "已清除 GitHub Token" else "GitHub Token 已保存")
-                    }) { Text("保存") }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showGitHubTokenDialog = false }) { Text("取消") }
+                        }
+                    )
                 }
-            )
-        }
-
-        // 清除 GitHub Token 二次确认（网盘页更多菜单）
-        if (showGitHubClearConfirm) {
-            AlertDialog(
-                onDismissRequest = { showGitHubClearConfirm = false },
-                title = { Text("清除 GitHub Token？") },
-                text = { Text("清除后 GitHub API 回退匿名限额（60 次/小时/IP）。") },
-                confirmButton = {
-                    TextButton(onClick = {
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val input = tokenInput.trim()
+                    if (input.isBlank()) {
+                        // 清空即清除 Token（无需联网校验）
                         GitHubTokenStore.setToken(context, null)
                         githubHasTokenState = false
-                        showGitHubClearConfirm = false
+                        showGitHubTokenDialog = false
                         SnackbarController.show("已清除 GitHub Token")
-                    }) { Text("清除", color = MaterialTheme.colorScheme.error) }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showGitHubClearConfirm = false }) { Text("取消") }
-                }
-            )
-        }
+                    } else {
+                        // 保存前先校验：无效 Token 会让 GitHub 拒绝之后的所有请求（含公开仓库解析）
+                        scope.launch {
+                            when (val check = githubApi.validateToken(input)) {
+                                is TokenCheck.Valid -> {
+                                    GitHubTokenStore.setToken(context, input)
+                                    githubHasTokenState = true
+                                    showGitHubTokenDialog = false
+                                    SnackbarController.show("GitHub Token 已保存（@${check.login}）")
+                                }
+                                TokenCheck.Invalid -> tokenError = "Token 无效或已过期，请重新生成后再保存"
+                                TokenCheck.Unknown -> tokenError = "无法校验 Token（网络异常），请联网后重试"
+                            }
+                        }
+                    }
+                }) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showGitHubTokenDialog = false }) { Text("取消") }
+            }
+        )
+    }
+
+    // 清除 GitHub Token 二次确认（网盘页更多菜单）
+    if (showGitHubClearConfirm) {
+        AlertDialog(
+            onDismissRequest = { showGitHubClearConfirm = false },
+            title = { Text("清除 GitHub Token？") },
+            text = { Text("清除后 GitHub API 回退匿名限额（60 次/小时/IP）。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    GitHubTokenStore.setToken(context, null)
+                    githubHasTokenState = false
+                    showGitHubClearConfirm = false
+                    SnackbarController.show("已清除 GitHub Token")
+                }) { Text("清除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showGitHubClearConfirm = false }) { Text("取消") }
+            }
+        )
     }
 }
 

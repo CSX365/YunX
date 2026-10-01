@@ -87,12 +87,8 @@ import com.yunx.app.data.network.ShareLinkParser
 import com.yunx.app.data.network.SharePlatform
 import com.yunx.app.ui.SnackbarController
 import com.mikepenz.markdown.m3.Markdown
-import com.mikepenz.markdown.model.DefaultMarkdownTypography
-import androidx.compose.ui.text.TextLinkStyles
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.unit.sp
-import androidx.compose.ui.text.font.FontWeight
 import com.yunx.app.ui.components.GitHubMarkdownImageTransformer
+import com.yunx.app.ui.components.compactMarkdownTypography
 import com.yunx.app.ui.resolve.DownloadLinkDialog
 import com.yunx.app.ui.resolve.ShareDetailScreen
 import com.yunx.app.ui.viewmodel.BaiduCloudViewModel
@@ -244,8 +240,8 @@ fun ResolveScreen(
                     onExit = { viewModel.backToInput() },
                     // 列表「返回上一级」：子目录回上级，根目录回输入页
                     onBack = { viewModel.navigateBack() },
-                    // GitHub 专属：forked from 头部、README 底部、文件徽章
-                    extraHeaderContent = if (viewModel.isGitHubPlatform) {
+                    // GitHub 专属：forked from 头部、README 底部（只在仓库首页显示，进子目录/退回账号列表不残留）
+                    extraHeaderContent = if (viewModel.githubAtRepoRoot) {
                         {
                             val parent = viewModel.githubParentFullName
                             if (parent != null) {
@@ -262,7 +258,7 @@ fun ResolveScreen(
                             }
                         }
                     } else null,
-                    extraFooterContent = if (viewModel.isGitHubPlatform) {
+                    extraFooterContent = if (viewModel.githubAtRepoRoot) {
                         {
                             val md = viewModel.githubReadme
                             val owner = viewModel.githubRepoOwner
@@ -293,33 +289,8 @@ fun ResolveScreen(
                                         com.yunx.app.data.prefs.SettingsRepository(context)
                                             .githubMirrorPrefix?.ifBlank { null }
                                     }
-                                    // 紧凑字号：对齐 GitHub 移动端观感（正文 14sp、标题逐级收紧、行距 1.35 倍）
-                                    val compactTypography = remember {
-                                        fun body(size: Int, bold: Boolean = false) = TextStyle(
-                                            fontSize = size.sp,
-                                            lineHeight = (size * 1.35f).toInt().sp,
-                                            fontWeight = if (bold) FontWeight.Bold else FontWeight.Normal
-                                        )
-                                        DefaultMarkdownTypography(
-                                            text = body(14),
-                                            code = body(13),
-                                            inlineCode = body(13),
-                                            h1 = body(20, true),
-                                            h2 = body(18, true),
-                                            h3 = body(16, true),
-                                            h4 = body(15, true),
-                                            h5 = body(14, true),
-                                            h6 = body(14, true),
-                                            quote = body(13),
-                                            paragraph = body(14),
-                                            ordered = body(14),
-                                            bullet = body(14),
-                                            list = body(14),
-                                            link = body(14),
-                                            textLink = TextLinkStyles(),
-                                            table = body(13)
-                                        )
-                                    }
+                                    // 紧凑字号：与更新说明共用同一份排版（见 ui/components/MarkdownTypography.kt）
+                                    val compactTypography = remember { compactMarkdownTypography() }
                                     Markdown(
                                         content = processed,
                                         modifier = Modifier.padding(bottom = 8.dp),

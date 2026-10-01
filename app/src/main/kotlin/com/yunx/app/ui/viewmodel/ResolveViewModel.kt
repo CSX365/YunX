@@ -651,6 +651,16 @@ class ResolveViewModel(
     /** 当前是否为 GitHub 平台（UI 据此渲染 README/forked from/徽章等额外内容） */
     val isGitHubPlatform: Boolean get() = currentPlatform == SharePlatform.GITHUB
 
+    /**
+     * 当前是否停在某个仓库的首页（仓库根目录）：fid 为 `github:root`（链接直达 / 跳上游仓库）
+     * 或 `github:repo:owner/name`（从账号仓库列表点进来）。
+     * README 与 forked from 只在仓库首页渲染：进「代码」「Releases」等子目录不显示，
+     * 返回账号仓库列表（github:account_root）也不残留。
+     */
+    val githubAtRepoRoot: Boolean
+        get() = isGitHubPlatform &&
+            (currentDirFid == "github:root" || currentDirFid.startsWith("github:repo:"))
+
     /** GitHub 下拉刷新指示器状态 */
     var githubRefreshing by mutableStateOf(false)
         private set
@@ -998,7 +1008,12 @@ class ResolveViewModel(
             uiState = ResolveUiState.Error("加载 Releases 失败")
             return
         }
-        if (rels != null) currentGitHubReleases.addAll(rels)
+        if (rels != null) {
+            // 并发/重放的加载（切 Tab 会重放 ShareDetailScreen 的 LaunchedEffect）会重复追加同一页，
+            // fid 重复 → LazyColumn key 冲突崩溃；按 tagName 去重后追加
+            val seen = currentGitHubReleases.mapTo(HashSet()) { it.tagName }
+            currentGitHubReleases.addAll(rels.filter { seen.add(it.tagName) })
+        }
         // 计算徽章：第一个非预发布非草稿 = 最新；其余按 prerelease/draft
         val badgeMap = mutableMapOf<String, String>()
         var latestMarked = false
@@ -1087,7 +1102,11 @@ class ResolveViewModel(
             uiState = ResolveUiState.Error("无法获取 $owner 的仓库列表")
             return
         }
-        if (repos != null) currentGitHubRepos.addAll(repos)
+        if (repos != null) {
+            // 同上：按 fullName 去重，避免重复 fid 触发 LazyColumn key 冲突
+            val seen = currentGitHubRepos.mapTo(HashSet()) { it.fullName }
+            currentGitHubRepos.addAll(repos.filter { seen.add(it.fullName) })
+        }
         // 徽章：fork 标记 + 主语言
         val badgeMap = mutableMapOf<String, String>()
         for (r in currentGitHubRepos) {
