@@ -101,6 +101,7 @@ import com.yunx.app.data.backup.AuthBackupManager
 import com.yunx.app.data.network.BaiduApi
 import com.yunx.app.data.network.C139Api
 import com.yunx.app.data.network.GitHubApi
+import com.yunx.app.data.network.GitHubLinkParser
 import com.yunx.app.data.network.GitHubTokenStore
 import com.yunx.app.data.network.Pan123Api
 import com.yunx.app.data.network.QuarkApi
@@ -751,7 +752,15 @@ fun MainScreen() {
                         actions = {
                             // 解析页标题右上角：收藏网盘链接入口
                             if (currentTab == MainTab.Resolve) {
-                                IconButton(onClick = { showBookmarks = true }) {
+                                IconButton(
+                                    onClick = { showBookmarks = true },
+                                    // ★ 收藏页就是从这个图标进来的：图标本身当"源"，用同一个 key 做容器变换，
+                                    //   打开时图标长成整页、关闭时收回图标（与设置页那三行的做法完全一致）
+                                    modifier = Modifier.sharedBounds(
+                                        rememberSharedContentState(OVERLAY_KEY_BOOKMARKS),
+                                        animatedVisibilityScope = sourceScope
+                                    )
+                                ) {
                                     Icon(Icons.Outlined.Bookmarks, contentDescription = "收藏网盘链接")
                                 }
                             }
@@ -798,7 +807,9 @@ fun MainScreen() {
                                     baiduCloudViewModel,
                                     c139CloudViewModel,
                                     ucCloudViewModel,
-                                    pan123CloudViewModel
+                                    pan123CloudViewModel,
+                                    bookmarkViewModel = bookmarkViewModel,
+                                    onOpenBookmarks = { showBookmarks = true }
                                 )
                                 MainTab.Drive -> DriveScreen(
                                     scrollBehavior = scrollBehavior,
@@ -940,15 +951,12 @@ fun MainScreen() {
                 val route = shownRoute
                 if (route != null) {
                     OverlayPage(
-                        modifier = if (route == OVERLAY_KEY_BOOKMARKS) {
-                            // 收藏页是从顶栏图标进来的，没有"被点的卡片"，不做形变
-                            Modifier
-                        } else {
-                            Modifier.sharedBounds(
-                                rememberSharedContentState(route),
-                                animatedVisibilityScope = targetScope
-                            )
-                        }
+                        // 收藏页的"源"是顶栏那个书签图标（见上），其余三页是设置页里被点的那一行；
+                        // 两者都用同一个 route key，所以这里不再需要特例分支
+                        modifier = Modifier.sharedBounds(
+                            rememberSharedContentState(route),
+                            animatedVisibilityScope = targetScope
+                        )
                     ) {
                         when (route) {
                             OVERLAY_KEY_ABOUT -> AboutScreen(
@@ -970,7 +978,13 @@ fun MainScreen() {
                                 onResolve = { link, pwd ->
                                     showBookmarks = false
                                     currentTab = MainTab.Resolve
-                                    resolveViewModel.startResolve(link, pwd)
+                                    // GitHub 收藏（仓库链接）走 GitHub 解析入口，与主页快捷方式一致
+                                    val github = GitHubLinkParser.parse(link)
+                                    if (github != null) {
+                                        resolveViewModel.startGitHubResolve(github)
+                                    } else {
+                                        resolveViewModel.startResolve(link, pwd)
+                                    }
                                 }
                             )
                         }

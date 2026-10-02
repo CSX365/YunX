@@ -253,6 +253,52 @@ FileNameText(text = file.fname, style = MaterialTheme.typography.bodyLarge, font
   （否则弹窗会瞬间消失，并与紧接着弹出的链接弹窗叠在一起）；同弹窗内的步骤切换（转存）不关弹窗，靠 `AnimatedContent` 淡入淡出。
 - `ShareFileRow` 只剩 `onClick` / `onMore` / `onLongClick`（`onSave` 参数已删）：行尾按钮只用于「点击行为被占用」的场景（文件夹点击进目录）。
 
+### 3.14 主页快捷方式：收藏链接「添加到主页」，标记存 Room 不存设置
+
+收藏页长按 → 「添加到主页」，被添加的收藏以网格出现在**解析页（主页）输入态下方**：
+
+- **数据**：`BookmarkEntity.homePinned: Boolean = false`（Room 列 `homePinned INTEGER NOT NULL DEFAULT 0`，`AppDatabase` 版本 13 → 14，
+  `MIGRATION_13_14` 用 `ALTER TABLE bookmark ADD COLUMN ...`）。**不要用 `SettingsRepository` 存一份 ID 列表** ——
+  置顶状态属于收藏本身，存设置会出现两份状态（删除收藏时残留、顺序无法同步）；Room Flow 天然让收藏页与主页同步刷新。
+  查询/写入走 `BookmarkDao.observeHomePinned()`（`WHERE homePinned = 1 ORDER BY createTime DESC`）与 `updateHomePinned(id, pinned)`，
+  经 `BookmarkViewModel.homeBookmarks`（StateFlow）与 `setHomePinned(id, pinned)` 暴露。
+- **UI**（`ui/screens/ResolveScreen.kt` 的 `HomeShortcutsSection` / `HomeShortcutTile`）：区块在「开始解析」按钮与错误卡片之后，
+  仍在同一个 `verticalScroll` 列里；**不能用 `LazyVerticalGrid`**（外层已纵向滚动，同方向嵌套滚动会崩），
+  用 `bookmarks.chunked(HOME_SHORTCUT_COLUMNS = 4)` 手写行网格，末行补 `Spacer(Modifier.weight(1f))` 保证格子等宽。
+  瓦片 = 48dp 圆角色块 + `FileNameText(maxLines = 2, textAlign = Center)`；
+  色块文字规则**只有一个实现**：`ResolveScreen.kt` 的 `internal fun homeTileLabel(bookmark)` = 自定义文字（`homeLabel`）
+  > `title` 前 `HOME_LABEL_MAX_LENGTH = 4` 个字 > 平台简称（`platformShortLabel`，标题为空时的兜底）；
+  返回空串才退回 `Icons.Outlined.Link` 图标。字号按字数自适应（≤2 字 `titleMedium` / 3 字 `labelLarge` / ≥4 字 `labelSmall`），
+  保证 4 个字在 48dp 方块里放得下（`maxLines = 1` + `TextOverflow.Ellipsis` 兜底大字号）。
+  自定义入口在收藏页长按菜单的「自定义图标文字」（仅 `homePinned` 时显示）：`HomeLabelDialog` 的输入框
+  用 `homeTileLabel(bookmark)` 作 placeholder（复用同一规则，不要另写一份"自动文字"），
+  存 `BookmarkEntity.homeLabel: String = ""`（Room 列 `homeLabel TEXT NOT NULL DEFAULT ''`，版本 14 → 15，`MIGRATION_14_15`），
+  经 `BookmarkDao.updateHomeLabel` / `BookmarkViewModel.setHomeLabel` 写库；空串 = 恢复自动文字。
+  空态给引导卡片（提示去收藏页添加）；标题右侧「管理」直接打开收藏页（`MainScreen` 的 `onOpenBookmarks = { showBookmarks = true }`）。
+- **交互**：点击瓦片 = 直接解析（GitHub 收藏先 `GitHubLinkParser.parse` → `startGitHubResolve`，其余 `startResolve`），
+  并把链接/提取码回填输入框；长按瓦片 → 确认弹窗后 `setHomePinned(id, false)` 移除（防误触）。
+- **收藏页**（`ui/screens/BookmarkScreen.kt`）：长按菜单增加「添加到主页 / 从主页移除」（`onToggleHome`），行内 `homePinned` 时显示「主页」小徽标。
+  `BookmarkScreen.onResolve` 与主页快捷方式都要走 GitHub 分支，GitHub 收藏（`platform = "GITHUB"`，即 `currentPlatform.name`）不能在网盘解析里被吞掉。
+- `FileNameText` 增加了带默认值的 `maxLines` / `textAlign` 参数（既有调用不受影响）：需要多行/居中的场景传参，不要绕开组件自己写 `Text`。
+
+### 3.15 叠加页容器变换（关于云析 / 支持开发 / 主题与外观 / 收藏）：源必须真的被移出组合
+
+`MainScreen.kt` 里四个叠加页共用一套「容器变换」（Container Transform），改这条链路前先读完本节：
+
+- **结构**：`SharedTransitionLayout` → 外层 `Box(背景 surface)` → 源 `AnimatedVisibility(visible = overlayRoute == null)`
+  （主界面）与目标 `AnimatedVisibility(visible = overlayRoute != null)`（`OverlayPage`）。
+  两者**互斥**，不是叠加：实测主界面常驻在下面时，叠加页里的 `Card` 底色会整片画不出来（见 `OverlayPage` KDoc）。
+- **源**：谁被点，谁就是源，用 `Modifier.sharedBounds(rememberSharedContentState(KEY), animatedVisibilityScope = sourceScope)`
+  加在那个元素上，并且**必须在源那侧 `AnimatedVisibility` 的 composable 作用域里构造**（`rememberSharedContentState` 是 `@Composable`）。
+  设置页那三行由 `MainScreen` 建好 modifier 传下去（`SettingsScreen` 的三个 row 参数）；
+  收藏页没有卡片，源就是**解析页顶栏的收藏图标**（`IconButton` 的 `modifier`，key `OVERLAY_KEY_BOOKMARKS`）。
+- **目标**：`OverlayPage(modifier = Modifier.sharedBounds(rememberSharedContentState(route), animatedVisibilityScope = targetScope))`，
+  `route` 取 `shownRoute`（**不是** `overlayRoute`：后者在返回瞬间就变 null，退出动画会没内容可渲染）。
+  新增叠加页时不要再写 `if (route == …) Modifier else …` 这类特例，一律走 sharedBounds。
+- **时长**：目标 `AnimatedVisibility` 的 `exit = fadeOut(tween(300))` 必须 ≥ bounds 形变时长（默认弹簧约 300ms），
+  否则退出一结束内容就被移出组合，回收形变被截断，观感像"没做动画"。
+- CSS 式的"共享元素"在这里就是同一把 key 的两侧修饰符；key 定义在 `MainScreen.kt` 的 `internal const val OVERLAY_KEY_*`。
+
 ---
 
 ## 4. 验证
