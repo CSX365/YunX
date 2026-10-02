@@ -1,0 +1,97 @@
+# Nightly 测试包构建：每天北京时间 0 点（UTC 16:00）定时跑一次，另支持手动触发。
+# 按作者要求（PR #113）：不打 tag、不发 GitHub Release，产物仅上传为 Actions Artifacts，
+# 供每日最新 master 的尝鲜测试，不污染正式版本号与更新检测。
+name: Nightly Build APK
+
+on:
+  # UTC 16:00 = 北京时间 00:00
+  schedule:
+    - cron: '0 16 * * *'
+  # 支持在 Actions 页手动触发
+  workflow_dispatch:
+
+# 只上传 Artifacts，不写 Release/tag：读权限即可（最小权限原则）
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 需要 git 历史与 gh CLI 才能比对最近成功构建的 SHA、读取 default branch HEAD
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle and dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      # 防重复：若 master 自上次成功构建以来没有新提交，则跳过本次 nightly，
+      # 避免每天定时跑出完全相同的包。手动 workflow_dispatch 也会受此保护（无新提交即跳过）。
+      - name: Skip if master has no new commit since last successful build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          git fetch origin master --quiet
+          HEAD_SHA=$(git rev-parse origin/master)
+          echo "当前 master HEAD: $HEAD_SHA"
+
+          # 最近一次本 workflow 成功 run 的 headSha（gh CLI 已预安装并带 GITHUB_TOKEN）
+          LAST_SUCCESS=$(gh run list \
+            --workflow "${{ github.workflow }}" \
+            --branch master \
+            --status success \
+            --limit 1 \
+            --json headSha \
+            --jq '.[0].headSha // ""')
+          echo "上次成功构建 SHA: ${LAST_SUCCESS:-（无）}"
+
+          if [ -n "$LAST_SUCCESS" ] && [ "$LAST_SUCCESS" = "$HEAD_SHA" ]; then
+            echo "::notice::master 自上次成功构建后无新提交，跳过本次 nightly"
+            echo "SKIP_BUILD=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build release APK
+        if: env.SKIP_BUILD != '1'
+        # 项目 settings.gradle.kts 按 YUNX_USE_MIRROR 切换仓库：CI 上阿里云镜像不可达，必须走官方源。
+        # runner 镜像预装 Android SDK（licenses 已接受），AGP 会自动补装缺失的 SDK 组件。
+        # release 变体开启 R8 混淆 + 资源压缩，产物显著小于 debug。
+        env:
+          YUNX_USE_MIRROR: 'false'
+        run: |
+          ./gradlew assembleRelease --no-daemon
+
+      # 产物只上传为 Actions Artifacts，命名按作者要求：YunX-nightly-<日期>-<短SHA>。
+      # 日期/短SHA 先在 shell 里算出来写进 GITHUB_ENV，再在 upload-artifact 的 name 里引用
+      # （name 字段不做 shell 展开，直接写 $() 在 Actions 里不会生效）。
+      - name: Resolve artifact name (date-shortSHA)
+        if: env.SKIP_BUILD != '1'
+        run: |
+          echo "ARTIFACT_NAME=YunX-nightly-$(date +%Y%m%d)-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+
+      - name: Upload APK as artifact
+        if: env.SKIP_BUILD != '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
