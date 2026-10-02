@@ -299,6 +299,64 @@ FileNameText(text = file.fname, style = MaterialTheme.typography.bodyLarge, font
   否则退出一结束内容就被移出组合，回收形变被截断，观感像"没做动画"。
 - CSS 式的"共享元素"在这里就是同一把 key 的两侧修饰符；key 定义在 `MainScreen.kt` 的 `internal const val OVERLAY_KEY_*`。
 
+### 3.16 深色模式字体发黑：全屏页必须有 `Surface`（`LocalContentColor` 默认是黑色）
+
+**症状**：深色模式下个别文字仍是黑色（历史案例：引导页第 1 页「云析」、第 2 页「使用前请阅读」）。
+**根因**：`LocalContentColor` 的默认值是 `Color.Black`，**只有 `Surface` / `Scaffold`（以及 Button、Card 这类自绘容器）才会把它设成
+`contentColorFor(底色)`**（如 `surface → onSurface`）。页面只要不在这些容器里，`Text` 不写 `color` 就是黑字 ——
+浅色模式看不出来，深色模式立刻暴露。
+
+**本项目的雷区**（都是「手动铺底色」、绕开了 Scaffold 的地方）：
+- `ui/screens/OnboardingScreen.kt`：`MainScreen.kt` 里 `if (showOnboarding) { OnboardingScreen(...); return }` 的提前返回全屏覆盖页；
+  已用 `Surface(modifier = modifier.fillMaxSize(), color = colorScheme.surface)` 包住整页（底色与 `BlobBackground` 的 base 一致，观感不变），
+  第 1 页「云析」与第 2 页「使用前请阅读」另外显式写了 `color = colorScheme.onSurface`。
+- `ui/MainScreen.kt` 的**横屏分支**：手动 `Row(NavigationRail + 内容)`，原先只有 `Box.background(background)`；
+  同样已换成 `Surface(color = colorScheme.background)` 包住内容与 Snackbar（此前横屏 + 深色模式下，列表里没写 color 的文件名会是黑字）。
+- 其它页面（登录页 / 关于 / 支持 / 主题 / 收藏 / 各 Tab 页）都有 `Scaffold`，或本身就是 `AlertDialog` / `ModalBottomSheet`（自带 Surface），不受影响。
+
+**约定**：
+1. 新增「全屏覆盖页 / 手动布局页」时用 `Surface` 铺底，不要用 `Modifier.background(...)`；确实只能用 `background` 时，页内每个 `Text` 都要显式给 `color`。
+2. 深色模式自查重点看**大标题**这类没写 `color` 的文本（最容易漏）。
+3. 排查手段：`grep -rn "Color(0x\|Color.White\|Color.Black" app/src/main/kotlin/com/yunx/app`（正常只应命中 `ui/theme/Color.kt` 的方案令牌）。
+
+---
+
+### 3.17 权限申请统一收口在引导页第 3 页（**别再往业务页面加"每次启动都弹"的检查**）
+
+**现状**：引导页第 3 页（`ui/screens/OnboardingPermissionPage.kt` 的 `PermissionPage(storageGranted, storageDenied, onRequestStorage)`）一次性过三件事：
+| 卡片 | 权限/设置 | 可申请的系统版本 | 入口 |
+| --- | --- | --- | --- |
+| 通知权限 | `POST_NOTIFICATIONS` | Android 13+ 可申请；低版本/被系统关闭 → 跳系统设置 | `PermissionState.canRequestNotifications()` → 申请，否则 `openNotificationSettings()` |
+| 后台运行 | 「忽略电池优化」白名单 | 全版本（系统设置页） | `PermissionState.requestIgnoreBatteryOptimizations()` |
+| 存储权限 | `WRITE_EXTERNAL_STORAGE` | **仅 Android 9 及以下**需要；10+ 走媒体库无需授权 | `PermissionState.storagePermissionRequired()` |
+
+**能否跳过**：通知与后台运行可跳过（只影响提醒 / 息屏存活）；**存储权限在 Android 9 及以下是必要权限，不给跳过** ——
+没有它 `DownloadManager` 会在保存前直接抛「未授予存储权限，无法保存到下载目录」（`data/download/DownloadManager.kt` 的 HLS 分支与分片合并分支各一处），
+所以存储权限状态提升在 `ui/screens/OnboardingScreen.kt`（`storageGranted` / `storageDenied` / `requestStorage` / `storageBlocking`）：
+未授权时底部 `OnboardingBottomBar(finishEnabled = !storageBlocking, ...)` 把「开始使用」按钮**置灰禁用**（`Button(enabled = false)`），
+**文案与图标恒为「开始使用」+ Check，不随状态改字**（用户明确要求：改文案会让人以为按钮变成了别的东西）；
+授权入口是权限页的「存储权限」卡片，授权成功返回后 `ON_RESUME` 重查 ⇒ 按钮自动恢复可点。
+卡片按钮在拒绝过一次后由「授权」改成「去设置授权」并走 `PermissionState.openAppDetails()`
+（避免授权框已被「不再询问」吞掉、点了没反应）。Android 10+ 的 `storageGranted()` 恒为 true ⇒ 这套阻塞逻辑完全不生效。
+
+**卡片按钮显示规则**：`PermissionCard` 内部只要 `granted == true` 就不渲染操作按钮 ——「去设置」只在真的需要用户动手时才出现，别在调用处补 `if`。
+
+**唯一状态入口**：`app/src/main/kotlin/com/yunx/app/util/PermissionState.kt`。
+`Build.VERSION.SDK_INT` 的分支只允许写在这个文件里（13+ 的运行时通知权限、9- 的存储权限、各系统设置 Intent 的兜底跳转都在里面），调用处不要再自己判断版本。
+
+**已从业务页面移除**（历史行为，勿恢复）：
+- `MainActivity.kt`：启动时的通知权限申请 + 「通知权限」引导弹窗（`notificationPermLauncher` / `showNotificationGuide` / `NotificationPermissionDialog`）。
+- `ui/MainScreen.kt`：首次下载任务启动时弹的「保持后台下载」电池优化 `AlertDialog`（`showBatteryGuide` / 监听 `downloadViewModel.tasks` 的 `LaunchedEffect`）。
+
+**保留的兜底**（有意为之，不冲突：只有用户真的用到该功能且权限缺失时才提示）：
+- `ui/MainScreen.kt` 的 `storagePermissionLauncher` + `downloadManager.storagePermissionProvider`（保存前兜底，Android 9- 才真会弹）。
+- `ui/screens/DownloadScreen.kt`：手动添加下载任务入口的存储权限兜底。
+- `ui/screens/SupportScreen.kt`：保存图片时的存储权限兜底。
+- `ui/screens/SettingsScreen.kt`：通知状态展示与手动申请、「通知栏下载进度」开关点击时申请、电池优化手动入口（设置页是用户主动去改的地方，不算打扰）。
+
+**注意**：权限授权框和系统设置页返回都会触发 `ON_RESUME`，所以引导页第 3 页的卡片状态用 `DisposableEffect(lifecycleOwner)` + `LifecycleEventObserver` 重查，
+不能只用 `remember { mutableStateOf(...) }` 的初值（否则会出现"授权完返回，卡片还显示未授权"）。
+
 ---
 
 ## 4. 验证
