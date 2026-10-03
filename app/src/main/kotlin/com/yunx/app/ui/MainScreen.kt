@@ -159,6 +159,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.yunx.app.data.network.HttpClients
+import com.yunx.app.ui.theme.ThemeController
 import com.yunx.app.ui.theme.effectsDefault
 import com.yunx.app.ui.theme.effectsFast
 
@@ -219,7 +220,7 @@ fun MainScreen() {
     // 最近一次成功拿到的真实 Release：既用于「发现新版本」弹窗，也供设置页的开发调试入口直接预览
     var latestRelease by remember { mutableStateOf<UpdateChecker.Release?>(null) }
     LaunchedEffect(Unit) {
-        when (val result = UpdateChecker.fetchLatestRelease()) {
+        when (val result = UpdateChecker.fetchLatestRelease(ThemeController.acceptPrereleaseUpdate)) {
             is UpdateChecker.CheckResult.Failure -> Unit // 启动检查不打扰用户，失败原因已由 UpdateChecker 打 E 级日志
             is UpdateChecker.CheckResult.Success -> {
                 val release = result.release
@@ -243,7 +244,7 @@ fun MainScreen() {
     val checkForUpdate: () -> Unit = {
         scope.launch {
             SnackbarController.show("正在检查更新…")
-            when (val result = UpdateChecker.fetchLatestRelease()) {
+            when (val result = UpdateChecker.fetchLatestRelease(ThemeController.acceptPrereleaseUpdate)) {
                 is UpdateChecker.CheckResult.Failure -> SnackbarController.show("检查更新失败：${result.reason}")
                 is UpdateChecker.CheckResult.Success -> {
                     val release = result.release
@@ -539,6 +540,14 @@ fun MainScreen() {
         if (resolveViewModel.downloadStarted) {
             currentTab = MainTab.Download
             resolveViewModel.consumeDownloadStarted()
+        }
+    }
+
+    // 网盘更新无法自动化时，切回「解析」Tab 由用户手动处理
+    LaunchedEffect(resolveViewModel.updateFallbackToResolve) {
+        if (resolveViewModel.updateFallbackToResolve) {
+            currentTab = MainTab.Resolve
+            resolveViewModel.consumeUpdateFallbackToResolve()
         }
     }
 
@@ -1020,11 +1029,11 @@ fun MainScreen() {
                         SnackbarController.show("未找到 APK 下载链接")
                     }
                 },
-                // 网盘更新：Release 说明里的网盘链接直接丢给解析流程（与收藏页的「解析」同一路径）
+                // 网盘更新：优先自动「转存 → 取直链 → 下载」，不适合自动化时回落到解析页
                 onNetdiskUpdate = { link ->
                     showUpdateSheet = false
-                    currentTab = MainTab.Resolve
-                    resolveViewModel.startResolve(link, null)
+                    SnackbarController.show("正在准备更新包…")
+                    resolveViewModel.startUpdateDownload(link)
                 },
                 onLater = { showUpdateSheet = false },
                 onIgnore = {

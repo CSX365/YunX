@@ -52,6 +52,7 @@ import androidx.compose.material.icons.outlined.Article
 import androidx.compose.material.icons.outlined.Backup
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Cloud
+import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Layers
@@ -112,6 +113,7 @@ import com.yunx.app.data.update.UpdateChecker
 import com.yunx.app.ui.SnackbarController
 import com.yunx.app.ui.theme.ListGroupGap
 import com.yunx.app.ui.theme.ListGroupPos
+import com.yunx.app.ui.theme.ThemeController
 import com.yunx.app.ui.theme.listGroupShape
 import com.yunx.app.util.LogExporter
 import com.yunx.app.ui.components.YunXLoading
@@ -451,11 +453,55 @@ fun SettingsScreen(
 
         SectionLabel("通用")
         SettingsItem(
-            icon = Icons.Outlined.SystemUpdate,
+            icon = Icons.Outlined.ContentPaste,
             shape = listGroupShape(ListGroupPos.FIRST),
+            title = "自动识别剪贴板",
+            description = if (ThemeController.clipboardSuggestEnabled) {
+                "复制分享链接后自动提示解析"
+            } else {
+                "已关闭，应用不再读取剪贴板"
+            },
+            onClick = {
+                ThemeController.setClipboardSuggestEnabled(
+                    context,
+                    !ThemeController.clipboardSuggestEnabled
+                )
+            },
+            trailing = {
+                Switch(checked = ThemeController.clipboardSuggestEnabled, onCheckedChange = null)
+            }
+        )
+
+        Spacer(modifier = Modifier.height(ListGroupGap))
+
+        SettingsItem(
+            icon = Icons.Outlined.SystemUpdate,
+            shape = listGroupShape(ListGroupPos.MIDDLE),
             title = "检查更新",
             description = "检查 GitHub 是否有新版本可用",
             onClick = onCheckUpdate
+        )
+
+        Spacer(modifier = Modifier.height(ListGroupGap))
+
+        SettingsItem(
+            icon = Icons.Outlined.SystemUpdate,
+            shape = listGroupShape(ListGroupPos.MIDDLE),
+            title = "接受预发布版更新",
+            description = if (ThemeController.acceptPrereleaseUpdate) {
+                "检查更新时包含 GitHub Pre-release（可能不稳定）"
+            } else {
+                "只接收正式版更新"
+            },
+            onClick = {
+                ThemeController.setAcceptPrereleaseUpdate(
+                    context,
+                    !ThemeController.acceptPrereleaseUpdate
+                )
+            },
+            trailing = {
+                Switch(checked = ThemeController.acceptPrereleaseUpdate, onCheckedChange = null)
+            }
         )
 
         Spacer(modifier = Modifier.height(ListGroupGap))
