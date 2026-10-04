@@ -58,6 +58,19 @@ class SettingsRepository(context: Context) {
             prefs.edit().putString("download_dir_uri", value).apply()
         }
 
+    /**
+     * Gopeed 引擎的下载目录（**真实文件系统路径**，如 `/storage/emulated/0/Download/YunX`）；
+     * 空 = 默认目录（公共 `Download` 根目录，与内置下载器同一口径，见 `StorageDirs`）。
+     *
+     * 为什么不复用 [downloadDirUri]：引擎是原生核心，写不了 SAF 的 `content://` 目录，只能拿真实路径。
+     * 用户在设置里选目录时走 SAF（从 tree Uri 反解真实路径），反解不到才让他手输，见 Agent.md §3.33。
+     */
+    var engineDownloadDir: String
+        get() = prefs.getString("engine_download_dir", "") ?: ""
+        set(value) {
+            prefs.edit().putString("engine_download_dir", value.trim()).apply()
+        }
+
     /** 最大同时下载任务数（默认 1：前台任务吃满带宽，其余排队；参考 IDM 默认单任务满速） */
     var maxConcurrentDownloads: Int
         get() = prefs.getInt("max_concurrent_downloads", DEFAULT_MAX_CONCURRENT_DOWNLOADS)
@@ -91,6 +104,21 @@ class SettingsRepository(context: Context) {
         get() = prefs.getBoolean("notification_show_speed", true)
         set(value) {
             prefs.edit().putBoolean("notification_show_speed", value).apply()
+        }
+
+    /**
+     * 下载引擎：`ENGINE_BUILTIN`（默认，项目自带的 Kotlin 分片下载器）
+     * 或 `ENGINE_GOPEED`（内置 Gopeed 引擎，需先在「下载引擎」页导入 AAR）。
+     *
+     * 取值非法（手改 prefs 等）时按内置下载器处理；引擎没就绪时 DownloadManager 也会自动回退，
+     * 不会因为设置项把下载功能弄坏。
+     */
+    var downloadEngine: String
+        get() = prefs.getString("download_engine", ENGINE_BUILTIN)?.takeIf {
+            it == ENGINE_BUILTIN || it == ENGINE_GOPEED
+        } ?: ENGINE_BUILTIN
+        set(value) {
+            prefs.edit().putString("download_engine", value).apply()
         }
 
     /** 夸克取链方式：true=免转存（直接换下载直链，不写入网盘，默认）；false=先转存到临时目录再取链 */
@@ -196,6 +224,12 @@ class SettingsRepository(context: Context) {
 
     companion object {
         const val DEFAULT_DOWNLOAD_THREADS = 32
+
+        /** 下载引擎标识（[downloadEngine] 的取值）：内置 Kotlin 分片下载器 */
+        const val ENGINE_BUILTIN = "builtin"
+
+        /** 下载引擎标识：内置 Gopeed 引擎（gomobile 核心，需用户导入 AAR） */
+        const val ENGINE_GOPEED = "gopeed"
         /**
          * 线程数上限 = 512（与设置页档位一致）。
          * 真正同时在飞的请求数另由 `DownloadManager.MAX_INFLIGHT_CHUNKS`（按最大堆预算推导、同样封顶 512）

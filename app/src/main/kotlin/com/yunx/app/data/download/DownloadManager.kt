@@ -23,6 +23,8 @@ import android.util.Log
 import com.yunx.app.util.LogRedactor
 import com.yunx.app.data.db.DownloadTaskDao
 import com.yunx.app.data.db.DownloadTaskEntity
+import com.yunx.app.data.gopeed.GopeedEngine
+import com.yunx.app.data.prefs.SettingsRepository
 import com.yunx.app.data.security.AndroidKeystoreCredentialCipher
 import com.yunx.app.data.security.CredentialCipher
 import kotlinx.coroutines.CancellationException
@@ -42,6 +44,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
@@ -243,6 +246,32 @@ class DownloadManager(
 ) {
     private val credentialCipher: CredentialCipher = AndroidKeystoreCredentialCipher()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /** 下载引擎开关等设置（DownloadManager 是应用级单例，读一次足够） */
+    private val settings by lazy { SettingsRepository(context) }
+
+    /** 引擎任务 ID 的内存索引：DB 的 `engineTaskId` 是持久化真源，这里只给 pause/start/remove 做同步判断 */
+    private val taskEngineIds = ConcurrentHashMap<Long, String>()
+
+    /**
+     * 已经计入「前台服务保活」的引擎任务。
+     *
+     * 引擎任务不走 [onTaskStarted]/[onTaskFinished] 的下载协程路径，保活要自己配对：**加入时**才
+     * 拉起前台服务 + WakeLock，**移除时**才允许释放。用集合的 add/remove 返回值去重，
+     * 保证无论从哪条路径终结（完成 / 失败 / 用户暂停 / 用户删除 / 引擎侧自己变 pause）都只扣一次。
+     */
+    private val engineKeepAliveIds = ConcurrentHashMap.newKeySet<Long>()
+
+    /** 引擎任务进度同步协程（同一时刻只跑一个；没有可同步任务时自己退出） */
+    private var engineSyncJob: Job? = null
+
+    /** 引擎任务同步间隔（毫秒）：引擎调用是本进程内分发，不存在网络开销，可以问得勤一点 */
+    private val engineSyncIntervalMs = 700L
+
+    init {
+        // 应用重启后历史引擎任务也要继续同步（引擎重启后它们一般是 pause，会被回写成本地「已暂停」）
+        startEngineSync()
+    }
 
     /** 当前实际下载中的任务数（用于最大同时下载任务数限制） */
     private val activeDownloads = java.util.concurrent.atomic.AtomicInteger(0)
@@ -487,8 +516,199 @@ class DownloadManager(
         if (size > 0) taskSizes[id] = size
         if (fallbackUrl.isNotBlank()) taskFallbackUrls[id] = fallbackUrl
         taskCallbacks[id] = onComplete
-        start(id, headers)
+        if (shouldUseEngine(platform)) {
+            // 任务登记、下载页展示、完成清理回调都与内置下载器完全一致，只有「执行」交给 Gopeed 引擎
+            startViaEngine(id, url, safeName, headers, platform)
+        } else {
+            start(id, headers)
+        }
         return id
+    }
+
+    /** 是否把任务交给 Gopeed 引擎：设置里选了引擎 + 引擎已导入；GitHub 走镜像回退（引擎不支持），始终用内置下载器 */
+    private fun shouldUseEngine(platform: String): Boolean =
+        platform != DownloadPlatform.GITHUB &&
+            settings.downloadEngine == SettingsRepository.ENGINE_GOPEED &&
+            GopeedEngine.isInstalled(context)
+
+    /**
+     * 用 Gopeed 引擎开始下载：确保引擎在跑 → 建任务 → 引擎任务 ID 写回本地记录 → 拉起进度同步。
+     *
+     * 建任务失败按普通失败任务落库（errorMsg 写引擎原文），不做静默回退到内置下载器——
+     * 用户明确选了引擎，悄悄换下载器比报错更难排查。
+     */
+    private suspend fun startViaEngine(
+        id: Long,
+        url: String,
+        fileName: String,
+        headers: Map<String, String>,
+        platform: String
+    ) {
+        val engineTaskId = try {
+            withContext(Dispatchers.IO) {
+                val dir = GopeedEngine.resolveDownloadDir(context)
+                if (GopeedEngine.state.value != GopeedEngine.State.RUNNING) {
+                    GopeedEngine.start(context, dir)
+                }
+                GopeedEngine.createTask(
+                    url = url,
+                    saveDir = dir,
+                    headers = headers,
+                    connections = threadProvider(platform),
+                    name = fileName,
+                    labels = mapOf("yunxTaskId" to id.toString())
+                )
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "引擎建任务失败：id=$id ${e.message}", e)
+            dao.updateStatus(id, DownloadTaskEntity.STATUS_FAILED)
+            dao.updateError(id, e.message ?: e.toString())
+            return
+        }
+        Log.d(TAG, "引擎任务已创建：yunxId=$id engineId=$engineTaskId")
+        taskEngineIds[id] = engineTaskId
+        // 记录本段运行起点：完成时用它算平均速度
+        taskStartTimes[id] = System.currentTimeMillis()
+        // 保活：第一个引擎任务拉起前台服务 + WakeLock，锁屏/退后台引擎才不会被系统收掉
+        if (engineKeepAliveIds.add(id)) onTaskStarted(id)
+        dao.updateEngineTaskId(id, engineTaskId)
+        dao.updateStatus(id, DownloadTaskEntity.STATUS_DOWNLOADING)
+        startEngineSync()
+    }
+
+    /**
+     * 引擎任务进度同步：把引擎侧状态回写到本地记录（下载页读的还是 Room，所以必须回写），
+     * 完成时触发 onComplete 清理回调。没有可同步任务就自动退出，下次建引擎任务时再拉起。
+     *
+     * 每轮先确保引擎在运行：进程重启后引擎里可能还有未完成任务（引擎自己持久化在 bolt 里），
+     * 引擎重启后这些任务一般是 pause 状态，会被回写成本地「已暂停」，由用户决定是否继续。
+     */
+    private fun startEngineSync() {
+        if (engineSyncJob?.isActive == true) return
+        engineSyncJob = scope.launch {
+            while (isActive) {
+                val pending = runCatching { dao.listSyncableEngineTasks() }.getOrDefault(emptyList())
+                if (pending.isEmpty()) return@launch
+                if (GopeedEngine.state.value != GopeedEngine.State.RUNNING) {
+                    runCatching {
+                        withContext(Dispatchers.IO) {
+                            GopeedEngine.start(context, GopeedEngine.resolveDownloadDir(context))
+                        }
+                    }.onFailure { Log.e(TAG, "引擎同步时启动引擎失败：${it.message}", it) }
+                }
+                for (task in pending) {
+                    taskEngineIds[task.id] = task.engineTaskId
+                    val status = runCatching {
+                        withContext(Dispatchers.IO) { GopeedEngine.taskStatus(task.engineTaskId) }
+                    }.getOrNull() ?: continue
+                    when (status.status) {
+                        "done" -> completeEngineTask(task, status.total)
+                        "error" -> {
+                            Log.e(TAG, "引擎任务失败：yunxId=${task.id} engineId=${task.engineTaskId}")
+                            dao.updateStatus(task.id, DownloadTaskEntity.STATUS_FAILED)
+                            dao.updateError(task.id, "Gopeed 引擎下载失败")
+                            _stats.update { it - task.id }
+                            taskEngineIds.remove(task.id)
+                            taskStartTimes.remove(task.id)
+                            releaseEngineTaskMemory(task.id)
+                            if (engineKeepAliveIds.remove(task.id)) onTaskFinished()
+                            DownloadService.notifyResult(
+                                context, task.id, task.fileName,
+                                success = false, error = "Gopeed 引擎下载失败",
+                                promote = showSpeedProvider()
+                            )
+                        }
+                        "pause" -> {
+                            dao.updateStatus(task.id, DownloadTaskEntity.STATUS_PAUSED)
+                            _stats.update { it - task.id }
+                            // 引擎侧自己变暂停（进程重启后未续传等）：保活到此为止，用户点继续时会重新拉起
+                            if (engineKeepAliveIds.remove(task.id)) onTaskFinished()
+                        }
+                        else -> {
+                            val total = if (status.total > 0L) status.total else task.totalSize
+                            dao.updateProgress(
+                                task.id,
+                                DownloadTaskEntity.STATUS_DOWNLOADING,
+                                status.downloaded,
+                                total
+                            )
+                            // 实时速度直接取引擎给的（TaskRuntimeStatus.speed），剩余时间自己算
+                            _stats.update {
+                                it + (task.id to DownloadStats(
+                                    speed = status.speed,
+                                    remainMillis = if (status.speed > 0L && total > status.downloaded) {
+                                        (total - status.downloaded) * 1000L / status.speed
+                                    } else {
+                                        -1L
+                                    },
+                                    chunkCount = threadProvider(task.platform).coerceAtLeast(1)
+                                ))
+                            }
+                            // 前台通知：与内置下载器共用同一条 2 秒节流和速度来源（_stats），所以写在 _stats 之后
+                            notifyProgress(task.id, task.fileName, status.downloaded, total)
+                        }
+                    }
+                }
+                delay(engineSyncIntervalMs)
+            }
+        }
+    }
+
+    /** 引擎任务完成：状态/保存路径/平均速度落库 + 触发清理回调（语义与内置下载器的完成路径一致） */
+    private suspend fun completeEngineTask(task: DownloadTaskEntity, size: Long) {
+        val savedPath = File(GopeedEngine.resolveDownloadDir(context), task.fileName).absolutePath
+        // 平均速度 = 引擎给出的总大小 ÷ 本段运行时长（暂停/继续会重置起点，与内置下载器口径一致）
+        val startedAt = taskStartTimes.remove(task.id) ?: 0L
+        val avgSpeed = if (startedAt > 0L && size > 0L) {
+            val elapsed = (System.currentTimeMillis() - startedAt).coerceAtLeast(1L)
+            size * 1000L / elapsed
+        } else {
+            0L
+        }
+        dao.complete(task.id, DownloadTaskEntity.STATUS_COMPLETED, savedPath, avgSpeed)
+        _stats.update { it - task.id }
+        Log.d(TAG, "引擎任务完成：yunxId=${task.id} engineId=${task.engineTaskId} path=$savedPath size=$size avg=$avgSpeed")
+        taskEngineIds.remove(task.id)
+        releaseEngineTaskMemory(task.id)
+        // 保活收尾 + 结果通知（与内置下载器走同一条前台通知通道）
+        if (engineKeepAliveIds.remove(task.id)) onTaskFinished()
+        DownloadService.notifyResult(
+            context, task.id, task.fileName,
+            success = true, promote = showSpeedProvider()
+        )
+        taskCallbacks.remove(task.id)?.let { cb -> runCatching { cb() } }
+    }
+
+    private fun releaseEngineTaskMemory(id: Long) {
+        taskHeaders.remove(id)
+        taskSizes.remove(id)
+        taskFallbackUrls.remove(id)
+    }
+
+    /** 引擎任务暂停：异步转发给引擎，状态由同步循环回写 */
+    private fun pauseEngineTask(id: Long, engineId: String) {
+        _stats.update { it - id }
+        // 用户主动暂停：保活立刻收尾，前台服务/WakeLock 不再为它保持
+        if (engineKeepAliveIds.remove(id)) onTaskFinished()
+        scope.launch {
+            runCatching { withContext(Dispatchers.IO) { GopeedEngine.pauseTask(engineId) } }
+                .onFailure { Log.e(TAG, "引擎暂停失败：id=$id ${it.message}", it) }
+            dao.updateStatus(id, DownloadTaskEntity.STATUS_PAUSED)
+        }
+    }
+
+    /** 引擎任务继续：转发 continue 并重新拉起同步 */
+    private fun resumeEngineTask(id: Long, engineId: String) {
+        scope.launch {
+            runCatching { withContext(Dispatchers.IO) { GopeedEngine.continueTask(engineId) } }
+                .onFailure { Log.e(TAG, "引擎继续失败：id=$id ${it.message}", it) }
+            // 本段运行起点重置：平均速度口径与内置下载器一致（最近一段运行）
+            taskStartTimes[id] = System.currentTimeMillis()
+            // 继续下载：重新拉起前台服务保活（暂停时刚刚收尾过）
+            if (engineKeepAliveIds.add(id)) onTaskStarted(id)
+            dao.updateStatus(id, DownloadTaskEntity.STATUS_DOWNLOADING)
+            startEngineSync()
+        }
     }
 
     /**
@@ -506,6 +726,11 @@ class DownloadManager(
 
     /** 开始/恢复下载（断点续传） */
     fun start(id: Long, headers: Map<String, String> = emptyMap()) {
+        // 引擎任务绝不能落到内置分片下载器（会重复下载同一个 URL）：转发 continue 即可
+        taskEngineIds[id]?.let { engineId ->
+            resumeEngineTask(id, engineId)
+            return
+        }
         // 恢复时未传 headers：沿用入队时保存的（Cookie/UA 对直链下载是必需的）
         val effectiveHeaders = headers.ifEmpty { taskHeaders[id] ?: emptyMap() }
         Log.d(TAG, "start: id=$id headers=${effectiveHeaders.keys}")
@@ -577,7 +802,8 @@ class DownloadManager(
     private suspend fun onTaskStarted(id: Long) {
         if (activeTaskCount.getAndIncrement() == 0) {
             val name = runCatching { dao.get(id)?.fileName }.getOrNull() ?: "下载任务"
-            DownloadService.start(context, name)
+            // 走引用计数版：内核包下载（KernelProvisioner）也在用同一条前台服务，谁都不能直接停
+            DownloadService.acquire(context, name)
         }
         // 锁屏保持下载：开启时获取 PARTIAL_WAKE_LOCK（息屏维持 CPU/网络）
         acquireWakeLockIfNeeded()
@@ -586,7 +812,7 @@ class DownloadManager(
     private fun onTaskFinished() {
         if (activeTaskCount.decrementAndGet() <= 0) {
             activeTaskCount.set(0)
-            DownloadService.stop(context)
+            DownloadService.release(context)
             releaseWakeLock()
         }
     }
@@ -614,6 +840,8 @@ class DownloadManager(
     /** 暂停下载（保留 part 文件与请求头） */
     fun pause(id: Long) {
         Log.d(TAG, "pause: id=$id")
+        // 引擎任务：额外通知引擎暂停；本地状态与清理继续走下面的原逻辑（引擎任务没有分片文件，两步互不干扰）
+        taskEngineIds.remove(id)?.let { engineId -> pauseEngineTask(id, engineId) }
         // 立即中断该任务所有分片网络请求（不依赖协程取消传播，阻塞 IO 马上停止）
         downloader.cancelCalls(id)
         val deferred = synchronized(jobsLock) { activeJobs.remove(id) }
@@ -643,6 +871,16 @@ class DownloadManager(
      */
     fun remove(id: Long, deleteLocal: Boolean = false) {
         Log.d(TAG, "remove: id=$id deleteLocal=$deleteLocal")
+        // 引擎任务：额外通知引擎删除；本地清理（DB 记录 + 已下载文件）继续走下面的原逻辑
+        taskEngineIds.remove(id)?.let { engineId ->
+            releaseEngineTaskMemory(id)
+            // 用户删除：保活收尾（未完成的任务被删掉后，前台服务不该继续挂着）
+            if (engineKeepAliveIds.remove(id)) onTaskFinished()
+            scope.launch {
+                runCatching { withContext(Dispatchers.IO) { GopeedEngine.deleteTask(engineId) } }
+                    .onFailure { Log.e(TAG, "引擎删除任务失败：id=$id ${it.message}", it) }
+            }
+        }
         // 立即中断该任务所有分片网络请求
         downloader.cancelCalls(id)
         _stats.update { it - id }

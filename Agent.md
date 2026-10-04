@@ -63,6 +63,7 @@ app/src/main/kotlin/com/yunx/app/
 │   │   ├── DownloadSaver.kt / DownloadService.kt（前台服务）
 │   │   └── DownloadPlatform.kt  # ★ 平台标识字符串常量
 │   ├── security/CredentialCipher.kt    # ★ Android Keystore 凭证加解密
+│   ├── gopeed/GopeedEngine.kt          # ★ Gopeed 进程内引擎（导入 AAR / 加载 .so / 进程内 REST，见 §3.27、§3.28）
 │   ├── backup/                  # 认证备份（口令派生密钥 + AES-GCM）
 │   ├── update/UpdateChecker.kt
 │   └── prefs/SettingsRepository.kt     # ★ 所有设置项的唯一入口
@@ -77,6 +78,11 @@ app/src/main/kotlin/com/yunx/app/
     ├── components/ items/       # 可复用小组件
     └── theme/                   # Color / Type / Theme / ThemeController
 ```
+
+另有两个不在 `app/src/main/kotlin` 下的关键路径：
+
+- `app/libs/gopeed-classes.jar` —— Gopeed 的 gomobile Java 桥接（**已打字节码补丁**，见 §3.28，勿用官方原版覆盖）；
+- `tools/patch-gopeed-classes.py` —— 生成上面那个 jar 的补丁脚本（**换新 AAR 时必须重跑**，见 §3.28）。
 
 ---
 
@@ -733,6 +739,491 @@ QQ 群号与仓库地址**只允许**写在 `app/src/main/kotlin/com/yunx/app/ut
 
 ---
 
+### 3.27 内置 Gopeed 下载引擎（导入 AAR · 进程内嵌 · 验证入口）
+
+**这一批只做可行性验证**：设置页多一行入口 → 导入 AAR → 加载 .so → 启动引擎 → 建一个测试任务 → 看进度 / 暂停 / 继续 / 删除。
+**现有 `DownloadManager` / `DownloadService` / 下载页链路一行没动**（§5 的机制全部照旧），验证通过再谈让 Gopeed 接管。
+
+**为什么是「一半编译期 + 一半运行时」**：AAR 里的 Java 桥接 `classes.jar` 只有 12 KB，作为**编译期依赖**进仓库
+（`app/libs/gopeed-classes.jar`，由 `tools/patch-gopeed-classes.py` 从官方 AAR 生成并打了 1 处字节码补丁，见 §3.28；
+`app/build.gradle.kts` 里 `implementation(files("libs/gopeed-classes.jar"))`），
+这样 gomobile 生成的类型签名保持原版；而 `jni/arm64-v8a/libgojni.so` 有 **56 MB**（静态链接整个 Go 运行时），
+**不进仓库也不进 APK**，由用户在设置页导入 AAR 后运行时解出并 `System.load`。
+**不做 DexClassLoader / 运行时 dex**（省掉类加载器命名空间问题）。
+
+**AAR 事实**（`libgopeed-arm64-v8a.aar`，24.9 MB）：package `go.libgopeed.gojni`，minSdk 21，只有
+`AndroidManifest.xml` + `classes.jar` + `jni/arm64-v8a/libgojni.so` + `proguard.txt`（内容恰为下面两条 keep）+ 空 R.txt/res。
+ELF 的 4 个 LOAD 段 `p_align=0x1000`(4096) ⇒ **不满足 16 KB 页对齐**，将来 Android 15+ 的 16 KB 页设备要重新用
+gomobile 编（`-ldflags="-extldflags=-Wl,-z,max-page-size=16384"`）；本机是 4096，不受影响。
+只带 arm64-v8a：其它 ABI 导入时会报「这个 AAR 里没有 jni/&lt;abi&gt;/libgojni.so」。
+
+**★ 加载顺序是硬约束**：必须**先 `System.load(<绝对路径>)` 成功，再触碰任何 `go.*` / `com.gopeed.*` 类**。
+桥接类的静态初始化一旦抛错，JVM 会把**该类的初始化失败永久记住**：同一进程里再点只会得到
+`NoClassDefFoundError`（真机第 2 次点击的报错就是这个），只能杀进程重开。
+`GopeedEngine.loadLibrary()` 先 `System.load(绝对路径)`，仅当它失败才回退 `System.loadLibrary("gojni")`
+（回退用于「.so 打进 jniLibs」那条兜底路线），两条原始错误文本都会保留并 `Log.e`。
+**兜底方案**：把 .so 放进 `app/src/main/jniLibs/arm64-v8a/`（AGP 会自动打进 APK，无需改 gradle），
+即可走系统 nativeLibraryDir 正常加载。补丁与真机失败的完整因果见 §3.28。
+
+**R8 必须保留**（`app/proguard-rules.pro`，与 AAR 自带 proguard.txt 一字不差）：
+`-keep class go.** { *; }` 与 `-keep class com.gopeed.** { *; }`——.so 是用 `FindClass` 反查这些类名的，
+release 混淆后名字一变就崩。
+
+**引擎调用方式**：`Libgopeed.start(cfgJson)` 返回端口（Go 侧出错时 native 抛 `go.Universe$proxyerror`，
+`getMessage()` 就是 Go 的 error 文本）；`Libgopeed.invokeAsync(method, path, query, body, requestID, listener)`
+走 **`rest.Dispatch` 进程内路由**，等价于 Gopeed 的 HTTP API 但**不开 TCP 端口**（配置里 `apiEnable=false` ⇒
+不监听、也不需要 apiToken）；`stop()` 内部上限 3 秒，超时未完成的任务以错误回调收尾。
+本批**没用** `subscribeTaskEvents`（进度用 1 秒轮询，够验证用）。
+
+**用到的路由 / 报文**（信封统一 `{code,msg,data}`，`CodeOk=0`）：`POST /api/v1/tasks`（建任务，body
+`{"req":{"url":"…"},"opts":{"path":"…"}}`，`data` = 任务 id）、`PUT /api/v1/tasks/{id}/pause`、
+`PUT /api/v1/tasks/{id}/continue`、`DELETE /api/v1/tasks/{id}`、`GET /api/v1/tasks/{id}/status`、
+`GET /api/v1/info`（`data.version`）。任务状态词：`ready/running/wait/pause/error/done`。
+
+**启动配置**（`GopeedEngine.buildConfig`，字段名对照 `pkg/rest/model/server.go`）：`storage="bolt"`、
+`storageDir`/`tempDir` 在 `filesDir/gopeed/{store,tmp}/`（目录要以分隔符结尾）、`apiEnable=false`、
+`refreshInterval=500`、`downloadConfig{downloadDir, maxRunning=1, autoStartTasks=false}`。
+注意 `autoStartTasks` 只管「启动时是否恢复未完成任务」，**新建任务照常立即开始**。
+
+**下载目录**：引擎只能按**真实文件系统路径**写（写不了 SAF 的 `content://` 目录），现在优先用公共的
+`Download/YunX`，权限不到位时自动退回应用外部私有目录 —— 完整规则、权限矩阵与 B 路线决策见 §3.29。
+
+**文件与接线**：`app/src/main/kotlin/com/yunx/app/data/gopeed/GopeedEngine.kt`（`object`，`State{NOT_INSTALLED,
+INSTALLED,RUNNING}`、`installFromAar`/`uninstall`/`start`/`stop`/`invoke`/`taskStatus`/`createTask`/`pauseTask`/
+`continueTask`/`deleteTask`/`engineVersion`）、`app/src/main/kotlin/com/yunx/app/ui/screens/GopeedScreen.kt`（验证页：
+状态卡 / 测试下载卡 / 当前任务卡 / **下载目录真实文件列表**——最后一卡是用文件系统交叉验证"确实落盘了"）；
+入口 = `SettingsScreen` 新增参数 `onGopeedClick` + 「下载引擎」分组一行，`MainScreen` 新增
+`OVERLAY_KEY_GOPEED` / `showGopeed` / 路由（普通淡入，不做共享元素形变）。
+页面里所有引擎调用都在 `Dispatchers.IO`（引擎方法会阻塞），UI 侧统一走 `action{}` 抢 `busy` 并把异常原文显示出来。
+
+**验证期已知边界**（都不是 bug）：引擎不随退后台保活（没做前台服务）；引擎任务**只在这个页面**可见，
+不会进 YunX 下载页（两套任务库不互通）；`System.load` 解出的 .so 占 56 MB 内部存储；重复导入同一个 .so
+在本进程内不会重新加载（提示需重启应用）。
+
+**回退**：删 `data/gopeed/GopeedEngine.kt` 与 `ui/screens/GopeedScreen.kt`、`app/libs/gopeed-classes.jar`
+及 build.gradle 里那行 `implementation(files(...))`、proguard 里那两条 keep、`SettingsScreen` 的
+`onGopeedClick` 参数与「下载引擎」分组、`MainScreen` 的 `OVERLAY_KEY_GOPEED`/`showGopeed`/路由/传参即可（无数据库改动）。
+
+---
+
+### 3.28 Gopeed 启动失败根因：`libgojni.so` 没有 DT_SONAME（**别把这条 loadLibrary 补丁回退掉**）
+
+**真机现象**（用户第一次点「启动引擎」，Android 10 / arm64-v8a）：
+
+```
+第 1 次：dalvik.system.PathClassLoader[DexPathList[[zip file "/data/app/com.yunx.app-…/base.apk"],
+        nativeLibraryDirectories=[…/lib/arm64, …/base.apk!/lib/arm64-v8a, /system/lib64, /system/product/lib64]]]
+        couldn't find "libgojni.so"
+第 2 次：com.gopeed.libgopeed.Libgopeed        （即 NoClassDefFoundError 的 message）
+```
+
+**根因（已坐实，不是权限问题也不是路径问题）**：AAR 里的 `libgojni.so` **没有 `DT_SONAME`**——实测其 dynamic 段
+只有 `DT_NEEDED = ['liblog.so','libandroid.so','libm.so','libdl.so','libc.so']`，`DT_SONAME` **缺失**。
+Android linker 只按 soname 认「已经加载过的库」，所以：
+
+1. `GopeedEngine.start()` 里的 `System.load(绝对路径)` **其实成功了**（⇒ 从应用私有目录 `filesDir` dlopen 这条路是通的）；
+2. 紧接着 `Libgopeed` 类初始化 → gomobile 生成的 `go.Seq.<clinit>` 里写死 `System.loadLibrary("gojni")`；
+   linker 既无 soname 可匹配、APK 的 `lib/arm64` 里也没有这个文件 ⇒ 抛 `UnsatisfiedLinkError`，
+   报错前缀就是那句 `PathClassLoader[DexPathList[…]]`（`loadLibrary` 独有的格式，与第 1 条一字不差）；
+3. 该失败发生在**类初始化**里 ⇒ JVM 永久记住 ⇒ 第 2 次点击变成 `NoClassDefFoundError`。
+
+**修复 = 5 字节字节码补丁**：`go/Seq.class` 的 `<clinit>` 里那条 `ldc "gojni"`(2 B) + `invokestatic
+java/lang/System.loadLibrary`(3 B) 原地写成 **5 个 `0x00`(nop)**。字节码总长度不变 ⇒ 所有偏移、异常表、
+StackMapTable 都不受影响（`max_stack` 只会变小，仍合法）。引擎库改由 `GopeedEngine.loadLibrary()` 在触碰
+任何 `go.*` / `com.gopeed.*` 类之前 `System.load(绝对路径)` 加载（加载顺序见 §3.27 的硬约束）。
+全 jar（18 个 class）扫描确认**只有 `go/Seq.class` 这一处** `System.loadLibrary`。
+
+**生成方式（可复现，仓库内自带脚本）**：
+
+```bash
+python3 tools/patch-gopeed-classes.py <libgopeed-<abi>.aar | classes.jar> app/libs/gopeed-classes.jar
+```
+
+`tools/patch-gopeed-classes.py` 是自包含脚本（只用标准库）：输入 AAR 时自动取其中的 `classes.jar`，
+只改 `go/Seq.class` 一个条目，**要求恰好命中 1 处**否则报错退出，改完还会重新反汇编复核残留为 0；
+实测输出：位置 = class 文件偏移 2190、原字节 `12 5C B8 00 5E`、实际变化 4 字节（第 4 字节本来就是 `0x00`）。
+**换新的 AAR（重新用 gomobile 打包）时必须重新跑一遍这个脚本并提交新的 jar。**
+
+**已否决的方案**（别再试，理由都在这里）：① 重写整个 `go/Seq.java` 源码替换（成员含 native 方法，签名差一点就崩）；
+② 自定义 `PathClassLoader(librarySearchPath=…)`（无 soname ⇒ 会把 56 MB 的 Go runtime 再加载一份）；
+③ 给 .so 补 `DT_SONAME`（`.dynamic` 里没有空槽、`dynstr` 偏移脆弱）；④ 把 .so 打进 `jniLibs`（可行但 APK 涨 56 MB，
+只作兜底）。
+
+**日志（用户要求，已加）**：`GopeedEngine` 全链路 `Log.d`/`Log.e` 打点——导入（abi、目标路径、AAR 条目列表）、
+加载（`System.load` 成功/失败原文、`loadLibrary` 回退结果）、启动（启动配置 JSON、`Libgopeed.start` 结果）、
+停止、`invoke`（方法/路径/body、超时、引擎返回原文）。抓取：`adb logcat -s GopeedEngine`。
+**日志里的 URL / body 必须经 `util/LogRedactor`（`url()` / `line()`）脱敏后再打**（§2 的脱敏规范），别直接打原始 URL。
+失败路径统一附带 `LOAD_HINT`（① `couldn't find "libgojni.so"` ⇒ jar 不是打过补丁的版本；② `NoClassDefFoundError`
+⇒ 桥接类在本进程已初始化失败，必须杀掉应用重开）。验证页也据此显示「杀掉应用重开」的提示，报错文本用
+`SelectionContainer` 包住方便整段复制。
+
+**真机操作提醒**：桥接类初始化失败后，**必须杀掉应用（最近任务划掉 / 强行停止）再重开**，否则同一进程里再点
+只会一直得到 `NoClassDefFoundError`。
+
+---
+
+### 3.29 内置引擎的落盘与权限（B 路线：申请「所有文件访问」）+ 两套下载器并存的决策
+
+**用户拍板的三个方向（2026-10-04，别再自行改回去）**：
+
+1. **落盘走 B 路线**：申请「所有文件访问」（`MANAGE_EXTERNAL_STORAGE`），让引擎直接写**公共目录**；
+2. **内核手动导入**：APK 不打包 56 MB 的 .so，继续由用户在设置页导入 AAR；**后续再做「应用内从 GitHub 下载 AAR」**；
+3. **两套下载器并存**：老的 `DownloadManager` 分片下载器与 Gopeed 引擎同时在仓库里，**应用内可切换**（切换 UI 待做）。
+
+**为什么不是「所有安卓版本都要所有文件访问」**（引擎只能按真实路径写文件，权限按版本分三档）：
+
+| 系统 | 写公共目录要什么 | 代码里怎么判断 |
+|---|---|---|
+| Android 9- | 运行时 `WRITE_EXTERNAL_STORAGE` | `PermissionState.engineStoragePermissionPending()` |
+| Android 10 | 同一个运行时权限 + manifest 的 `requestLegacyExternalStorage="true"` 回到旧模式 | 同上（Q **也要**申请，别以为 10 就不用了） |
+| Android 11+ | `MANAGE_EXTERNAL_STORAGE`（「所有文件访问」），**只能用户去系统设置手动开** | `PermissionState.allFilesAccessRequired()/allFilesAccessGranted()` |
+
+Android 10+ 原本那套「保存到公共目录」走 MediaStore/SAF，**不需要任何存储权限**——
+所以 `PermissionState.storageGranted()` 在 10+ 恒为 true，**那三个方法不要改**，它们是给 MediaStore/SAF 路径用的；
+引擎这条真实路径的判断是新增的 `allFilesAccessRequired/allFilesAccessGranted/engineStoragePermissionPending`。
+（引导页 `OnboardingScreen` 只在 Android 9- 申请 `WRITE_EXTERNAL_STORAGE`，所以 **Android 10 上大概率还没授权**，
+引擎页必须自己补申请入口。）
+
+**目录解析**（`GopeedEngine.resolveDownloadDir(context)`）：**自定义目录**（`SettingsRepository.engineDownloadDir`，
+见 §3.33）→ `StorageDirs.defaultDownloadDir()`（公共 `Download` 根目录，与内置下载器同一默认口径）→
+`Android/data/<包名>/files/gopeed`；**可写性用「试写探针」判断**——建目录 + 写一个 `.yunx_write_probe` 再删掉，
+成功才用该目录，否则 `Log.e` 后退回下一档。不按系统版本推断权限是因为各 ROM 对 legacy / 分区存储的处理并不一致。
+（**§3.33 起默认目录不再是 `Download/YunX`**：`PUBLIC_DIR_NAME` 已删除，默认就是 `Download` 根目录。）
+
+**UI**（`GopeedScreen`）：状态卡显示当前生效的下载目录 + 存储权限三态提示（未授权/已就绪）+ 一个按钮
+（Android 11+ 跳「所有文件访问」页；10- 弹运行时授权框）；`LocalLifecycleOwner` + ON_RESUME 刷新，
+从系统设置返回后目录会自动切换（`remember(allFilesReady, legacyStorageReady)` 重新解析）。
+**权限是给引擎启动时写进配置的默认目录用的，但每个任务的 `opts.path` 才是真正落盘位置**，
+所以授权后不需要重启引擎，下一个任务就用新目录。
+
+**为什么不用 MediaStore 直写绕开权限**：MediaStore 只支持顺序流式写，而 Gopeed 是多连接随机写（seek + 分片），
+天然不兼容；要零权限就只能「引擎下到私有目录 → 完成后复制到公共目录」，那是 A 路线（已完成评估，未采用）。
+
+**已核实、接管时可以直接用的引擎能力**（读的是 Gopeed 源码 `pkg/protocol/http/model.go`）：
+`req.extra.header`（`map[string]string`，网盘直链要的 UA/Referer/Cookie 都能带）、
+`opts.extra.connections`（分片并发，正好映射现有「按网盘分别设置分片并发数」）、
+`Request.Labels`（可塞 YunX 侧任务 id 做映射）。
+**缺口**：`DownloaderStoreConfig` 里没有限速字段，现有「速度限制」设置项无法平移；重试由引擎自己管。
+
+**风险提示**：`MANAGE_EXTERNAL_STORAGE` 属于特殊权限，Google Play 需要申报用途、
+F-Droid 侧也可能触发审核（本项目已有 fastlane 元数据）；如果哪天因为分发渠道要放弃它，
+退回 A 路线（下到私有目录后复制）即可，代码里只影响 `resolveDownloadDir` 与权限 UI 两处。
+
+---
+
+### 3.30 两套下载器并存：设置项切换 + Gopeed 任务映射进本地库（DB v17）
+
+**开关**：`SettingsRepository.downloadEngine`（`ENGINE_BUILTIN` 默认 / `ENGINE_GOPEED`），设置页「下载引擎」分组第一行可切；
+取值非法时按内置处理。**默认永远偏向内置下载器**——引擎是可选增强，设置项本身不能把下载功能弄坏。
+
+**分流点只有一个**：`DownloadManager.enqueue()` 末尾的 `start(id, headers)` 之前。
+任务登记（`dao.insert`）、请求头保存、`taskCallbacks`、`taskSizes` 两条路完全一致，只是「谁来执行」不同：
+
+```
+if (shouldUseEngine(platform)) startViaEngine(...) else start(id, headers)
+```
+
+`shouldUseEngine()` = 平台不是 GitHub（GitHub 走镜像回退，引擎不支持）**且** 设置选了引擎 **且** `GopeedEngine.isInstalled()`。
+放这里的好处是**全部 20+ 个调用点（解析页 / 网盘页 / 下载页手动添加）自动生效，一行都不用改**。
+⚠️ 走到引擎分支时若建任务失败，**按失败任务落库、errorMsg 写引擎原文，不静默回退内置下载器**——
+用户明确选了引擎，悄悄换下载器比报错更难排查。
+
+**引擎任务 ID 进本地库（DB v17）**：`DownloadTaskEntity.engineTaskId`（空串 = 内置下载器），
+`MIGRATION_16_17` 就是一句 `ALTER TABLE download_task ADD COLUMN engineTaskId TEXT NOT NULL DEFAULT ''`。
+**留一列而不是另建表**，是为了让下载页、暂停/继续/删除、完成清理全部复用现有逻辑，UI 零改动。
+（v17 是升版本，装新包会走迁移；但**别把旧 APK 装回已升到 17 的设备**，会撞 Room 降级校验，见 §3.7。）
+
+**进度同步**（`startEngineSync`，`init{}` 里就会拉起一次）：每 700ms 拉一次 `dao.listSyncableEngineTasks()`
+（`engineTaskId != ''` 且状态不是完成/失败），逐个调 `GopeedEngine.taskStatus()` 回写本地记录：
+`done` → `dao.complete` + 触发 `taskCallbacks`（夸克转存清理等回调照常）；`error` → 失败落库；
+`pause` → 已暂停；其余 → `updateProgress`。没有可同步任务时协程自己 `return`，下次建引擎任务再拉起。
+引擎调用走的是 `invokeAsync` **进程内分发**（不是 HTTP），所以 700ms 的频率没有网络开销。
+每轮开头会确保引擎在运行：进程重启后引擎 bolt 里可能还有任务，它们通常是 pause 状态，被回写成「已暂停」由用户决定是否继续。
+
+**操作转发**（关键：`start` 必须拦截，否则内置下载器会用同一个 URL 重复下载）：
+
+| 操作 | 处理 |
+|---|---|
+| `start(id)` | 命中 `taskEngineIds` 就**提前 return**，改为转发 `continueTask` |
+| `pause(id)` | **不提前 return**：转发引擎暂停后继续走原逻辑（本地状态置「已暂停」、没有分片文件所以清理是空操作） |
+| `remove(id)` | 同上：额外转发 `deleteTask`，本地删记录/删文件的逻辑完全复用 |
+
+`taskEngineIds` 是内存索引（`ConcurrentHashMap<Long, String>`），同步循环每轮从 DB 补齐；
+`pause/remove` 里先用 `remove(id)` 取值（拿不到就说明不是引擎任务，行为与以前完全一致）。
+
+**速度显示（引擎任务也有）**：同步循环把引擎 `TaskRuntimeStatus.speed` 写进 `_stats`，剩余时间按
+`(total - downloaded) / speed` 自己算，分片数用 `threadProvider(platform)`（就是提交任务时给引擎的 connections），
+所以下载页的实时速度、剩余时间、线程数与内置下载器**显示口径一致**；完成后 `dao.complete` 的 avgSpeed
+按「引擎给出的总大小 ÷ 本段运行时长」算（`taskStartTimes` 在创建/继续时重置，与内置下载器同口径）。
+暂停/失败/完成时都会把该任务从 `_stats` 移除，避免残留速度。
+
+**设置页 UI**：下载引擎两项（`下载引擎选择` + `Gopeed 下载引擎` 入口）已挪到**「下载」分组最前**，
+原来的「下载引擎」分组已删除。选 Gopeed 时用一段 `AnimatedVisibility(expandVertically/shrinkVertically)`
+隐藏**确实只对内置分片下载器有意义**的 4 项：下载保存目录（引擎固定写 `Download/YunX`）、
+最大同时下载任务数（引擎侧 `maxRunning` 写死 1）、下载速度限制（引擎不支持）、失败自动重试（引擎自己管）。
+**保留**「下载线程数」（映射到 `opts.extra.connections`，真生效）、「免转存下载」（夸克取链方式，与下载器无关），
+以及「锁屏后保持下载」「通知栏下载进度」——后两项对引擎任务**同样生效**（引擎任务走同一套前台服务、
+WakeLock 与通知通道，见 §3.31），一开始误判成"只作用于内置下载器"藏起来了，已改回。
+隐藏的 4 项都是分组中段的行，折叠后不影响首尾圆角（**以后改分组可见项时记得一起看圆角**）。
+
+**已知边界（都是有意为之，不是 bug）**：引擎**不支持限速**，所以「速度限制」设置对引擎任务无效（已隐藏）；
+内置下载器的分片/重试设置对引擎任务无意义（引擎有自己的连接与重试）。
+
+**回退**：设置里切回「内置分片下载器」即可让新任务全部回到老下载器（引擎任务仍在，可手动删）；
+要彻底拆掉就删 `engineTaskId` 列相关代码 + `startViaEngine`/`startEngineSync`/`pauseEngineTask`/`resumeEngineTask`
+以及 enqueue/start/pause/remove 里的四个分支（DB 版本号别回退，理由同上）。
+
+---
+
+### 3.31 引擎任务的前台保活（复用内置下载器那一套，别另起一套）
+
+**结论**：引擎跑在进程内（`GopeedEngine` 是 object 单例），**只要进程活着引擎就活着**，所以保活要做的只有一件事——
+让「有引擎任务在跑」也算作「有下载在跑」，从而复用现有前台服务：
+
+| 现有机制（都在 `DownloadManager`） | 引擎任务怎么接 |
+|---|---|
+| `onTaskStarted(id)`：第一个任务 → `DownloadService.start()` + `acquireWakeLockIfNeeded()` | 建任务成功、用户点继续时调用 |
+| `onTaskFinished()`：最后一个任务 → `DownloadService.stop()` + `releaseWakeLock()` | 完成/失败/用户暂停/用户删除/引擎侧自己变 pause 时调用 |
+| `notifyProgress(id, fileName, new, total)`：2 秒节流 + 从 `_stats` 取速度 | 同步循环里每轮回写进度后调用（**必须写在 `_stats.update` 之后**，否则通知里的速度慢一拍） |
+| `DownloadService.notifyResult(...)`：终态通知（含流体云胶囊） | 完成/失败时调用，`promote = showSpeedProvider()` 与内置下载器一致 |
+
+**★ 前台服务的起停一律走引用计数**：`DownloadService.acquire(context, title)` / `release(context)`
+（§3.34 引入，`onTaskStarted/onTaskFinished` 内部已从 `start()/stop()` 换成这一对）。
+同一时间只有一条前台通知，而保活来源不止 `DownloadManager` 一家（内核包下载也借它），
+直接 `stop()` 会把别人的保活一起关掉。**新增调用方必须成对 acquire/release**。
+
+**★ 配对靠 `engineKeepAliveIds`（`ConcurrentHashMap.newKeySet<Long>()`）**：`add(id)` 返回 true 才拉起保活，
+`remove(id)` 返回 true 才收尾，所以无论从哪条路径终结都**恰好扣一次**（引擎任务不走下载协程，没有
+`finally` 可以依赖，重复扣会让前台服务提前退出、漏扣会让服务一直挂着耗电）。
+新增"任务终结路径"时**必须**补一个 `if (engineKeepAliveIds.remove(id)) onTaskFinished()`。
+
+**进程重启后**：`markInterruptedAsPaused()` 会把引擎任务标成「已暂停」，保活集合是空的、不会误拉服务；
+用户点继续时 `resumeEngineTask` 重新 `add` 并拉起。**进程被系统杀掉时引擎随之停止**，前台服务的作用是
+大幅降低被杀概率，不是绝对保活（这也是没有把引擎做成独立进程的原因：独立进程要跨进程通信，成本远大于收益）。
+
+---
+
+### 3.32 下载引擎页（替换掉验证期的 Gopeed 测试页）+ 启动自动加载
+
+**页面形态**：设置 → 「下载引擎」→ `app/src/main/kotlin/com/yunx/app/ui/screens/DownloadEngineScreen.kt`
+（验证期的 `GopeedScreen.kt` **已删除**）。**一张卡片（圆角 20dp / 段内边距 16dp）里上下两段，
+中间一条 `outlineVariant` 细线**：每段 = 圆角图标块（40dp / 12dp 圆角，选中段用 `primaryContainer` 高亮）
++ 标题（`titleMedium` + Medium）+ 可选小标签（「实验性」用 `Surface(primaryContainer)` 小圆角块，`labelSmall`）
++ 说明（`bodySmall` / `onSurfaceVariant`）+ **整宽按钮**（44dp 高 / 14dp 圆角 / `labelLarge`）：
+
+**尺寸口径（用户反馈「字体布局那些有点太大了、不够现代美观」后整体压了一档）**：整页只允许标题 `titleMedium`、
+说明与元信息 `bodySmall`、按钮文字 `labelLarge`、徽标 `labelSmall`——与设置页 `SettingsItem`
+（`titleMedium` + `bodyMedium`）同一档；**别再往 `titleLarge` / 52dp 按钮 / 28dp 圆角 / 20dp 段内边距上加**。
+间距：卡外 12dp、段内 12dp、元信息块（下载目录 / 权限）内 6dp。
+
+| 段 | 主按钮 | 点击行为 |
+|---|---|---|
+| 内置分片下载器 | 当前引擎 → tonal 按钮「使用中」（带对勾、不可点）；否则描边按钮「切换到此引擎」 | 写 `downloadEngine = ENGINE_BUILTIN`（**不动**在跑的引擎任务） |
+| Gopeed 引擎 | **没导入内核 → 描边按钮「导入内核」**（走 SAF 选 AAR）；已导入但没存储权限 →「先授予存储权限」（点它去授权）；已导入且未选中 →「切换到此引擎」；已选中 → tonal「使用中」 | 导入内核 / 授权 / 切换引擎 |
+
+Gopeed 段里还带着：**引擎状态**（未导入内核 / 已导入，未启动 / 运行中）、内核大小与核心版本、下载目录、
+存储权限状态与授权按钮，以及**只在已切到 Gopeed 时**出现的「重启引擎」和常驻的「删除内核」两个 `TextButton`。
+**切换成 Gopeed 时若内核已导入且引擎没在跑，顺手把它启动起来**（`chooseEngine` 里做），省得用户再点一次。
+
+**三条交互口径**（用户逐条反馈后定的，改之前先读这里）：
+
+1. **没有存储权限就不给切到 Gopeed**（用户："要切换到 Gopeed 引擎时，必须要给存储权限，没给不给切换"）。
+   判断用 `PermissionState`：`allFilesAccessRequired() && !allFilesAccessGranted()` 或
+   `engineStoragePermissionPending(context)`，合成一个 `storageBlocked`（**提到 composable 顶部算**，
+   因为 `chooseEngine` 的硬拦截也要用）。缺权限时主按钮文案/图标/行为都换成权限入口
+   （「先授予存储权限」+ `FolderOpen` → `requestStoragePermission()`），**不是**切完再报错；
+   `chooseEngine(ENGINE_GOPEED)` 里另有一道硬拦截：`notice = "还没有存储权限，不能切换到 Gopeed 引擎"` 后 `return`。
+   理由：引擎写不了 SAF，没权限就只能落私有目录（11+ 用户在文件管理器里根本看不到），切过去等于白切。
+2. **不提供「启动引擎 / 停止引擎」，只提供「重启引擎」**（用户："没切换到 Gopeed 却能点击启动引擎……
+   我们不提供停止引擎的功能和启动引擎的功能，给他改成重启引擎"）。所以：
+   - 引擎操作整行只在 `installed && engineOn` 时给（内置下载器模式下引擎不该在跑，删掉"启动"入口）；
+   - 「重启引擎」= `GopeedEngine.stop()` + `start()`（`stop` 幂等、`start` 在 RUNNING 时直接返回端口，
+     所以两者顺序不能反），重启后补一次 `engineVersion`；
+   - **切回内置不停引擎**：切换只决定"新任务由谁执行"，页面顶部就写着"已存在的任务不受影响"，
+     在跑的引擎任务被 stop 掉就自相矛盾了。引擎空转着直到进程结束或用户点「重启引擎」——可接受。
+     **不要**在 `chooseEngine(ENGINE_BUILTIN)` 里加 `stop()`（我加过又删了）；
+   - 「删除内核」不再要求用户先手动停止：它自己先 `stop()` 再 `uninstall()`（`uninstall` 在 RUNNING 时会抛
+     「请先停止引擎」，旧 UI 有停止按钮时尚可自救，现在没按钮了就必须自己停）。
+3. **内核状态要进页面先与真实文件对齐**（用户："选择内置下载器时（有导入内核），重启应用后引擎状态却显示未导入内核"）。
+   根因：`GopeedEngine._state` 是进程内单例、初值 `NOT_INSTALLED`，只在导入/启动/停止/卸载时被写过；
+   选内置下载器时 `YunXApp` 的启动流程**根本不会碰引擎**，于是状态永远停在"未导入"。
+   修法：新增 `GopeedEngine.syncInstalledState(context)`（`RUNNING` 不动，其余按 `soFile().isFile` 写回
+   `INSTALLED`/`NOT_INSTALLED`，只做一次 stat），在 `YunXApp.autoStartGopeedIfSelected` 开头
+   （**在"选没选 Gopeed"的 return 之前**）和引擎页 `LaunchedEffect(Unit)` 里各调一次。
+   `DownloadManager` 那两处 `state.value != RUNNING` 的判断只看"在不在跑"，不受这个同步影响。
+
+**动效**（规格一律取自 `ui/theme/Motion.kt`，别另写时长；**透明度/颜色用 `effects*`、位移/尺寸用 `spatial*`**）：
+**本页没有自己的入场动画**——它是由设置页「下载引擎」那一行做**容器变换**「长」出来的，
+再叠一层淡入/上移会和形变打架（第一版写了 `fadeIn + slideInVertically`，已删）；
+**引擎状态文字用 `AnimatedContent`** 淡入淡出（`effectsFast`）；图标块的底色/图标色走 `animateColorAsState`
+（`effectsDefault`，与 `OnboardingScreen.kt` 里指示点颜色同一口径），切换引擎时「选中态」是渐变过去的而不是硬切；
+内核就绪后才出现的下载目录/权限那一段用 `AnimatedVisibility` 淡入淡出。
+
+**容器变换（Container Transform）接线**（和「主题与外观 / 关于云析 / 支持开发」三行完全同款，用户点名要这效果）：
+源侧 = `MainScreen.kt` 在 `SharedTransitionLayout` 作用域里构造
+`Modifier.sharedBounds(rememberSharedContentState(OVERLAY_KEY_GOPEED), animatedVisibilityScope = sourceScope)`，
+作为 `engineRowModifier` 传给 `SettingsScreen`，再挂到那一行的 `SettingsItem(modifier = engineRowModifier)`；
+目标侧 = `OverlayPage` 已按 `overlayKeyFor(...)` 用同一个 `OVERLAY_KEY_GOPEED` 做了 `sharedBounds`，**不用改**。
+（`MainScreen` 里这几个源侧修饰符必须在 composable 作用域一次性建好再传下去：`rememberSharedContentState`
+是 `@Composable`，不能包在普通 lambda 里延迟构造。）
+
+**删内核必须顺手切回内置**（用户报的 bug：选了 Gopeed 再删内核，设置项还停在 Gopeed）：
+页面里删完内核后若当前引擎是 Gopeed 就写回 `ENGINE_BUILTIN` 并提示「内核已删除，已自动切回内置分片下载器」；
+`YunXApp.autoStartGopeedIfSelected` 里也做了同样的**自愈**（启动时若设置是 Gopeed 但内核不存在 → 写回内置）。
+两道一起做的原因：`DownloadManager.shouldUseEngine()` 本来就会因内核缺失回退到内置下载器，
+不修的话会出现「设置界面说在用引擎、实际跑的是内置下载器」的错位。
+**删之前自己先 `stop()`**：`GopeedEngine.uninstall` 在 RUNNING 时抛「请先停止引擎」，旧 UI 有停止按钮时
+用户可以自救，现在（口径 2）没有停止按钮了，必须由删除动作自己停。
+
+**验证期那些测试功能全部去掉**：URL 输入建任务、当前任务进度/暂停/继续/删除、下载目录文件列表——
+它们只是用来验证引擎能不能跑通，正式入口是解析页/网盘页/下载页的正常下载流程。
+
+**设置页只留一行**：原来「下载引擎选择」+「Gopeed 下载引擎」两行合并成一行「下载引擎」（副标题显示当前引擎），
+点击进独立页面；那个切换弹窗已删除。副标题靠 `ON_RESUME` 重新读 `settingsRepo.downloadEngine` 同步
+（引擎在独立页面里改，返回设置页必须刷新）。`MainScreen` 那边沿用 `OVERLAY_KEY_GOPEED` / `showGopeed` 两个名字
+（只是内部标识，指向的已经是新页面）。
+
+**启动自动加载**：`YunXApp.autoStartGopeedIfSelected(ctx)`（在 `onCreate` 末尾调用）——
+**第一件事是 `engine.syncInstalledState(ctx)`**（必须放在"设置里选的是不是 Gopeed"那个 `return` 之前，
+否则选内置下载器时根本走不到，见口径 3）；然后设置选了 Gopeed **且**已导入内核时，起一个后台 `Thread`
+把引擎加载起来（首次要 `System.load` 56 MB 的 .so 并初始化 Go runtime，提前加载能让第一个任务不必等）。
+**任何失败只 `Log.e`**：引擎起不来不能影响应用启动，真正的下载会按失败任务落库并提示。
+设置读取用 `SettingsRepository`（别自己拼 prefs 键名）。
+
+---
+
+### 3.33 下载目录统一口径 + Gopeed 自定义下载目录（SAF 反解 / 手输兜底）
+
+**默认目录统一**（用户要求「默认的下载目录统一为 `/storage/emulated/0/Download/`」）：
+新增 `app/src/main/kotlin/com/yunx/app/util/StorageDirs.kt` —— 两套下载器的**默认目录唯一来源**，
+`defaultDownloadDir(): File` = `Environment.getExternalStoragePublicDirectory(DIRECTORY_DOWNLOADS)`，
+`defaultDownloadPath(): String` 给 UI 展示。内置分片下载器本来就走 MediaStore 的 `RELATIVE_PATH = Download`
+（`DownloadSaver.mediaStoreDestination`，无子目录时就是它），所以这里只是**把引擎的默认从 `Download/YunX`
+改成 `Download` 根目录**：`GopeedEngine.PUBLIC_DIR_NAME` **已删除**，UI 里两处引用一并改掉（别再写死 "YunX"）。
+
+**自定义目录为什么不能直接复用内置那套**：内置下载器存的是 `SettingsRepository.downloadDirUri`
+（SAF `content://` tree Uri），而 Gopeed 是原生 Go 核心，`opts.path` **只认真实文件系统路径**，
+给它 `content://` 直接失败。所以引擎另存一份 `SettingsRepository.engineDownloadDir`（`String`，空 = 默认目录）——
+**同一个设置行，两种表示**：设置页「下载保存目录」这一行在两种引擎下都显示，只是存的东西不同。
+
+**SAF → 真实路径（可行性结论：主存储可以，第三方 provider 不行）**：
+`GopeedEngine.realPathFromTreeUri(uri: Uri): File?` —— 只认 authority `com.android.externalstorage.documents`
+（系统「文件」应用里代表本机存储的那些位置），取 `DocumentsContract.getTreeDocumentId()` 得到
+`primary:Download/YunX` 或 `1A2B-3C4D:xxx`，按 `:` 切开：`primary` → `Environment.getExternalStorageDirectory()`
+（即 `/storage/emulated/0`），其余当卷名 → `/storage/<卷名>`，再拼上相对路径。
+**第三方 provider（网盘 / Google Drive 之类）的 documentId 不对应任何真实路径，一律返回 null** ——
+那里的调用方必须退到手输，**绝不能把 content:// 或它的 docId 当路径交给引擎**。
+（`DownloadSaver.safDirDisplay` 早就在做类似的反解，但那条只取 `substringAfterLast(':')` 用于**显示**，
+不能拿来当路径用。）
+
+**落盘前的校验**：`GopeedEngine.prepareDownloadDir(path: String): File` —— 必须以 `/` 开头的绝对路径，
+`mkdirs()` 建目录 + `canWrite()` 试写探针，失败抛 `IllegalArgumentException`，**消息直接给用户看**
+（用 `require`/`throw` 的文案写清楚是"路径不对""建不出目录"还是"不可写"；不可写且缺「所有文件访问」时附带提示）。
+设置页的 SAF 流程与手输弹窗都走它，口径一致。
+
+**设置页交互**（`SettingsScreen` 的「下载保存目录」行，从 `AnimatedVisibility(!engineOn)` 里**移出来**常驻）：
+- **行圆角固定在 `ListGroupPos.MIDDLE`，不要按引擎改成 LAST**。第一版按"引擎模式下它是可见分组的末行"
+  改成了 LAST，被用户一眼看出不对：折叠掉的只是"只对内置有意义"的那几项，**组并没有结束**——
+  这一行后面还有「免转存下载 / 锁屏后保持下载 / 通知栏下载进度」，整个「下载」组一直到最后的通知栏那行
+  才收尾（那里才是 `LAST`）。改成 LAST 就成了"底边圆了却还接着下一行"。
+- **组内 3dp 发丝缝（`ListGroupGap`）必须放在 `AnimatedVisibility` 外面**。第一版把补的 gap 放在了折叠块
+  **开头**（为了内置模式行距不变），结果引擎模式一折叠间距就跟着消失 → 这一行与「免转存下载」贴在一起，
+  也就是用户说的"边距错误"。正确做法：`Spacer(ListGroupGap)` 放在这一行**之后、AnimatedVisibility 之前**，
+  块内只留原有的那几个 gap —— 两种模式行距都对，内置模式观感与改动前完全一致。
+  （教训：`AnimatedVisibility` 折叠的是内部**全部**高度，包括里面的 Spacer；跨模式的间距不能藏在里面。）
+- `onClick`：两种模式都先 `dirLauncher.launch(null)`（SAF）；
+  **引擎模式**拿到 uri 后 `realPathFromTreeUri` → `prepareDownloadDir` → 写 `engineDownloadDir`；
+  反解失败或不可写 → **弹手输弹窗**（`showEngineDirDialog`）；`ActivityNotFoundException`（选择器被卸载 #90）
+  在引擎模式下也直接弹手输弹窗（内置模式维持原来的 Snackbar 提示）。
+- `trailing`「恢复默认」：按当前引擎清对应的那一项（`engineDownloadDir = ""` / `downloadDirUri = null`）。
+- 副标题：引擎模式空 = `Gopeed 默认 /storage/emulated/0/Download（点击自定义）`，非空 = `Gopeed：<路径>`。
+- **不单独给「手动输入」按钮**（刻意的）：正常情况下 SAF 就能选到本机目录并反解出路径，
+  手输只是兜底，硬塞进 trailing 会把这一行挤爆；触发路径就是"选了拿不到真实路径的位置"。
+  以后若要暴露，priority 放在同一行的 trailing 里加第二个 `TextButton`，别做成独立入口。
+- **`val engineOn` 必须声明在 `dirLauncher` 之前**（回调里要用它）；它原来声明在布局中间，已上移。
+
+**运行期行为**：`resolveDownloadDir` 每 700 ms 的同步循环/建任务时都会调，自定义目录**不可写就记日志退回默认目录**
+（SD 卡拔了、权限被撤销时，退回默认比让每个任务都失败好）；引擎页显示的「下载目录」就是这个函数的返回值，
+所以自定义后打开引擎页能看到真实生效的目录。**改目录不影响已存在的任务**（和引擎切换同一口径）。
+
+### 3.34 内核的云端获取（GitHub / 网盘自动下载 → 自动导入）
+
+内核不再只能靠用户手动找 AAR：引擎页的「导入内核」按钮会弹一个来源菜单
+**「从云端下载 / 导入本地 AAR」**，本地那条就是原来的 `OpenDocument` 流程，一行没动。
+
+**整条链路都在 `data/gopeed/KernelProvisioner.kt` 一个对象里**（取包 → 下载 → 校验 → 导入 → 清理），
+界面（`DownloadEngineScreen`）只收集它的 `phase: StateFlow<Phase>` 渲染弹窗，不持任何下载逻辑。
+**刻意不复用 `DownloadManager.enqueue`**，三个原因：① 内核包落在**应用私有目录**
+（`GopeedEngine.kernelTempDir` = `Android/data/<包名>/files/gopeed/kernel`），不放公共 Download，
+所以也不需要任何存储权限；② 下载过程**不进「下载」页**、不落库、完成即自动导入；
+③ 界面要的是「一个关不掉的进度弹窗」，不是任务列表里的一行。
+复用的是底层零件：`ChunkDownloader`（Range 分片 + 断点续传 + 严格字节校验）、
+`UpdateChecker`（Release 抓取，仓库参数化）、`QuarkResolveRepository`（网盘解析）、
+`GopeedEngine.installFromAar`（导入）。
+
+**已核实的硬事实（改之前先信这几条，别再猜）**：
+- 内核仓库 `CYQawa/yunx_gopeed_build` 的 Release：tag `1`（name `Gopeed AAR`），
+  资产是 **4 个按架构分包** `libgopeed-{arm64-v8a, armeabi-v7a, x86_64, x86}.aar` + `SHA256SUMS.txt`；
+  body 里正好是 `[网盘下载](https://pan.quark.cn/s/fe29d0d39745)`，被现有的
+  `UpdateChecker.netdiskDownloadUrl()` 直接命中（那个正则本来就是给更新弹窗写的，一份两用）。
+- **网盘分享就是 GitHub 资产的同名镜像**：同样 4 个包名、大小逐一对应（合计 102,390,074 B）。
+  所以网盘侧挑包的**唯一键是文件名**，不需要猜大小或顺序。
+- **匿名（未登录）能下**：分享 token 不需要登录，游客取链返回 `dl-guest-*` 直链（要回带 `__pugs`），
+  Range 可用（实测 `206` + `Content-Range`）。四个包 24.8–26.3 MB **全部低于夸克游客约 50MB 的上限**，
+  所以「没登录也能自动下」是常态，「超上限」才是兜底提示。
+- **ABI 只有一个对齐点**：`GopeedEngine.kernelAssetName()` = `libgopeed-${preferredAbi()}.aar`，
+  下载挑包与 `installFromAar` 里「精确匹配 `jni/<abi>/libgojni.so`」必须同源；
+  **Release / 分享里缺本机架构的包要直接报错，绝不静默换个架构下**（那样导入必然失败，还会被当成包坏了）。
+  为此 `preferredAbi()` 从 private 改成 public。
+
+**取链口径（用户指定）**：已登录夸克 → **转存优先**（`getShareDownloadLink`，会在用户网盘里建临时目录，
+用完必须 `cleanupTempDir` 删掉），转存失败才回退**免转存**（`getShareDownloadLinkWithoutSave`）；
+未登录 → 游客取链（`getGuestShareDownloadLink`）。直链请求头与「网盘下载」完全一致
+（`Cookie` + `QuarkConstants.API_USER_AGENT` + `DownloadReferer`；游客态必须用 `link.guestCookie` 顶掉 Cookie，
+缺了 CDN 412）。**转存临时目录的清理放在 `finally` 里且包了 `NonCancellable`** ——
+协程被取消后普通挂起调用会立刻抛异常，不包就正好在「用户点取消」这条路径上泄漏用户网盘里的垃圾。
+
+**下载**：分片数 = `min(目标片数, MAX_CHUNKS, 总大小/256KB)`。**网盘通道的目标片数是固定 64**
+（`PAN_CHUNKS`，用户口径，**不看**设置页那个夸克档：夸克 CDN 按连接限速，连接越多越接近满速；
+25MB 切 64 片每片约 389KB，仍远大于一个 TCP 窗口），GitHub 通道按设置页的「下载线程数」（GitHub 档）。
+`MIN_CHUNK_BYTES` 因此定在 **256KB** —— 按 1MB 收敛的话 25MB 最多只能切出 25 片，根本到不了 64。
+探不到大小就退回单流 `downloadFull`；服务器忽略 Range 时**清掉分片重来走单流**
+（绝不按分片写整文件）。断点续传：分片文件留在私有目录里，下次下载按 `partFile.length()` 接着写。
+镜像站下载会把直链作为 `fallbackUrl`，主地址失败自动回退（与「网盘更新」的 APK 同一口径）。
+GitHub 通道额外做 **sha256 校验**（用 Release 资产自带的 `digest`，网盘通道拿不到摘要就跳过），
+校验不过直接丢弃、绝不拿去导入。
+**保活借的是内置下载器那条前台服务**（`DownloadService`）。★ 服务的起停**必须走引用计数版的
+`DownloadService.acquire(context, title)` / `release(context)`**（本次为它新加的两个静态方法，
+`DownloadManager.onTaskStarted/onTaskFinished` 也已从 `start/stop` 换成这两个）：
+同一时间只有一条前台通知，而保活的来源不止一家（内置任务 + 内核包下载），
+直接 `stop()` 会出现「内核下完把用户正在跑的下载的保活一起关掉」。
+调用方自己配对：`DownloadManager` 用它的 `activeTaskCount`，`KernelProvisioner` 用自己的
+`keepAliveAcquired` 标志 —— **一次都没 acquire 过就 release 会把计数打成负数，同样会误关别人的保活**。
+内核侧的进度走通知栏（2 秒节流，与内置下载器同口径），收工（完成/失败/取消）在 `finally` 里 release。
+
+**导入前后两件事**（都容易踩）：
+1. 导入前**必须先 `GopeedEngine.stop()`**（`installFromAar` 不允许在 RUNNING 时覆盖 .so），
+   导入后如果它原来就在跑，**立刻 `start()` 拉回来**，别因为更新内核把正在下载的任务晾着。
+2. 新 `.so` **只有全新进程才 dlopen 得进来**（已加载的库卸载不掉），所以导入成功后页面提示
+   「需要重启应用才会用上新内核」——这是 `installFromAar` 的既有语义，不是 bug。
+   ★ 这条状态用 `GopeedEngine.pendingRestartForNewKernel`（本次新增的 `private set` 只读属性，
+   由 `installFromAar` 按 `loaded` 置位）承载，**不要借 `lastError` 传**：内核更新流程是
+   `stop()` → 导入 → `start()` 连着走的，而 `start()` 开头就会把 `lastError` 清空，提示会被顺手抹掉；
+   何况 `lastError` 的 setter 是 `private`，外部连补写都做不到
+   （第一版正是这么写的，CI 直接报 `Cannot access 'lastError': it is private in GopeedEngine`）。
+
+**弹窗是故意关不掉的**：`AlertDialog(properties = DialogProperties(dismissOnBackPress = false,
+dismissOnClickOutside = false))`，25MB 的下载不该被一次误触甩掉；要中断只能按「取消」
+（`KernelProvisioner.cancel()` → 取消 OkHttp Call + 取消协程，分片保留可续传）。终态（完成/失败）才给「关闭」。
+阶段文案跟着 `Phase` 走：获取版本 → 解析地址 → 分片下载（百分比 + 速度 + 分片数）→ 合并 → 导入。
+
+**落点**：`data/gopeed/KernelProvisioner.kt`（新增，全链路）、`GopeedEngine.kt`（`preferredAbi()` 提 public、
+新增 `kernelAssetName()` / `kernelTempDir()`）、`data/update/UpdateChecker.kt`
+（`fetchLatestRelease(includePrerelease, repo)` + `Asset.size/digest`）、
+`ui/screens/DownloadEngineScreen.kt`（菜单 + 底部弹窗 + 进度弹窗）。
+
+---
+
 ## 4. 验证
 
 
@@ -753,6 +1244,8 @@ QQ 群号与仓库地址**只允许**写在 `app/src/main/kotlin/com/yunx/app/ut
 | `FlowRow` / `FilterChip` | 需 `@OptIn(ExperimentalLayoutApi::class)` / `ExperimentalMaterial3Api` |
 | `combinedClickable` | 需 `@OptIn(ExperimentalFoundationApi::class)` |
 | 图标找不到 | 已引入 `material-icons-extended`，确认图标名与 `Outlined`/`Filled` 命名空间 |
+| `rememberSaveable` 报 `Unresolved reference` | 包名是 `androidx.compose.runtime.saveable.rememberSaveable`（**不是** `runtime.rememberSaveable`）；写错会级联出一片 `Unresolved reference 'it'` / `@Composable invocations can only happen…`，别被后面的报错带偏 |
+| `animateColorAsState` 报 `Unresolved reference` | 包是 `androidx.compose.animation.animateColorAsState`（**不是** `androidx.compose.animation.core`）。判断依据：`.animation` 放的是**进出场/内容切换**（`AnimatedVisibility`/`AnimatedContent`/`fadeIn`/`fadeOut`/`slideInVertically`/`togetherWith`/`animateColorAsState`），`.animation.core` 放的是**时间曲线与动画值**（`tween`/`spring`/`Animatable`/`animateFloatAsState`/`animateDpAsState`）。写错包会连带一片 `Cannot infer type for this parameter`（`by` 委托推不出类型） |
 | Room 编译报 schema 错 | 检查 `version` 是否 +1、Migration 是否注册 |
 
 ---
