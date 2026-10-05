@@ -1381,16 +1381,86 @@ desugaring），统一走 `AnnouncementTime.kt` 的 `SimpleDateFormat`；`'Z'` �
 
 ---
 
+### 3.36 凭证密钥失效（改锁屏密码必读）
+
+**症状（1.2.8 线上三份崩溃报告，同一根因三种形态）**：用户在**设置里改了锁屏密码/指纹**、
+或系统/厂商 keystore 升级后，App 冷启动即崩，栈顶落在
+`AndroidKeystoreCredentialCipher` 的 `cipher.init` 上：
+
+```
+java.security.InvalidKeyException: Keystore operation failed
+Caused by: android.security.KeyStoreException: Key not found
+Caused by: android.security.KeyStoreException: Invalid key blob（internal code -33，
+            upgrade_keyblob_if_required_with）
+android.security.keystore.KeyPermanentlyInvalidatedException: Key permanently invalidated
+```
+
+**机制**：密钥建在 `AndroidKeyStore`（别名 `yunx.account.credentials.v1`，AES-GCM，**没有**也不该有
+`setUserAuthenticationRequired(true)`）。但 keyblob 在部分 ROM/系统版本上会随设备凭证变化而
+**永久解不开**——查无此键、blob 无法升级、或被系统直接作废。三种报错都是同一件事：
+**只有这一把密钥能解的密文，全废了**（六个平台账号 + GitHub Token + 下载任务请求头）。
+
+**修复前为什么是「崩」而不是「重新登录」**：两处叠加。
+
+1. `SecureAccountDaos` 里每处都是 `stored?.let { decryptXxx(...) }`，而 `decryptXxx` 是 **suspend
+   函数** —— **接收者表达式先于 `withContext` 求值**，所以 `key()` 抛的 Keystore 异常
+   **根本没进** `withContext` 里的 `try`，直接从 `getAccount()` 冒到调用方协程（主线程）。
+2. 例外异常类型是 `Error` 系（如 `ProviderException`）或 `KeyStoreException` 时，
+   `catch (error: Exception)` 的旧写法也接不住。
+
+**现在的口径（改这块之前先读）**：
+
+- `CredentialKeyException` 分**两种**，上层必须区分（`CredentialStore.isKeyLost`）：
+  - `PermanentlyInvalid`：条目永久失效 ⇒ 密文再也解不开 ⇒ 该清就清 + 提示重登；
+  - `Unavailable`：Keystore **暂时**进不去（设备还锁着等）⇒ **只返回 null，绝不删数据**，
+    删了等于把用户本来还能解开的账号白白作废。
+- `AndroidKeystoreCredentialCipher` 自愈：**条目坏了**才删坏条目 → `generateKey()` 建新密钥 →
+  **整段加解密流程重试一次**。重试必须在 `withRetry` 那一层包住整段，不能只重试 `key()`——
+  部分机型把「初始化失败」推迟到 `doFinal` 才报。
+- **删键前必须先确认 Keystore 可达**（`discardStaleEntry` 里先 `openKeyStore()`）：
+  连 `KeyStore.load` 都进不去时抛 `Unavailable`，不许删。
+- `isKeyProblem` 是**严格白名单**，而且**判断顺序有陷阱**：`AEADBadTagException` 是
+  `GeneralSecurityException` 的子类，**必须先单独排除**，否则「密文被改 / 跨版本残留」会被
+  误判成密钥故障 ⇒ 把**好密钥**删掉 ⇒ 全部账号真的作废。
+- `AndroidKeystoreCredentialCipher.shared` 是**全进程唯一实例**：DAO（`AppDatabase.get`）、
+  `GitHubTokenStore`、`DownloadManager` 三处必须共用。分开 new 会让 `cachedKey` 各缓存一份、
+  `onKeyProvisioned` 只被最后一个注册者收到。
+- `onKeyProvisioned` 只在**真的 `generateKey()`** 时回调（不是「失败过」）：首次启动本来就没键，
+  不能据此判定「旧密文作废」。
+- 提示链路：数据层只写一个 SharedPreferences 标记（`CredentialStore.installRecovery` 在
+  `YunXApp.onCreate` 装配，必须早于任何凭证读写），`MainScreen` 弹一次 `AlertDialog`。
+  标记用 `commit()` 而不是 `apply()` —— 同一线程内先写后读，异步落盘的旧值会让提示不弹。
+
+**自愈路径（各自清各自那条，不做全局清库）**：账号走 `SecureAccountDaos.decryptGuarded`（并给
+`observeAccount()` 挂 `.catch { emit(null) }`，异常击穿的是收集方协程）；GitHub Token 走
+`GitHubTokenStore.getToken` 的失败删除；下载请求头走 `DownloadManager.loadPersistedHeaders` 的
+`runCatching`（重置成空表）。**故意不在失钥回调里无差别清空账号表**——判断稍有偏差就不可恢复，
+宁可让每个平台各自失败一次。
+
+**落点**：`data/security/CredentialCipher.kt`、`data/db/SecureAccountDaos.kt`、
+`data/db/AppDatabase.kt`、`data/network/GitHubTokenStore.kt`、`data/download/DownloadManager.kt`、
+`ui/MainScreen.kt`、`YunXApp.kt`；回归测试 `app/src/test/kotlin/com/yunx/app/data/db/SecureAccountDaosTest.kt`
+（CI 跑 `./gradlew testDebugUnitTest`，三个用例钉住「不崩 / 永久失效清数据 / 暂时不可用保数据」）。
+
+---
+
 ## 4. 验证
 
 
 写完代码后逐项自查，然后交付：
 
-0. **先跑两个脚本**（本地没有编译器，这两个能挡住大部分 CI 往返）：
+0. **先跑三个脚本**（本地没有编译器，这些能挡住大部分 CI 往返）：
    - `python3 ~/.yunx-bal/ktcheck.py <改动的 .kt ...>`：词法检查（注释嵌套 / 字符串闭合 / 括号配对）；
    - `python3 ~/.yunx-bal/impcheck.py`：**必须整项目跑**（无参数），找「用了但没 import」的符号 ——
      它靠"别处 import 过这个名字"当证据，只扫单文件会漏报。已用它验证过：故意删掉
      `pointerInput` 的 import，它会直接报出与 CI 完全相同的行号。
+   - `python3 ~/.yunx-bal/vischeck.py`：**必须整项目跑**（无参数），找**跨文件可见性冲突** ——
+     `impcheck` 查不到这类错（符号确实存在、只是访问不到，报的是 `Cannot access ...`）。
+     已知两类：① `private companion object` 里放 public 成员（companion 的可见性会连带锁住
+     自己的成员，别处 `Foo.shared` 就编译不过）；② 文件 B 里写 `private fun Foo.bar()` 却被
+     文件 A 调用。已用它验证过：把 `AndroidKeystoreCredentialCipher` 的 companion 改回
+     `private`，它会报出与 CI 完全相同的三处调用点（`AppDatabase.kt:91`、
+     `DownloadManager.kt:251`、`GitHubTokenStore.kt:40`）。
 1. **import 是否齐全**：新用到的 Composable、动画 API、图标、协程 API 都有对应 import。
 2. **实验性 API 注解**：见下方「常见编译坑」表。
 3. **符号一致性**：改了函数签名后，`grep` 一遍旧签名/旧调用点，确认无残留。
@@ -1407,6 +1477,7 @@ desugaring），统一走 `AnnouncementTime.kt` 的 `SimpleDateFormat`；`'Z'` �
 | `combinedClickable` | 需 `@OptIn(ExperimentalFoundationApi::class)` |
 | `Unresolved reference 'pointerInput'` + 同 lambda 里 `detectTransformGestures` / `size` / `detectTapGestures` 全报 `Cannot infer type for this parameter` | **一个 import 缺失、级联一片**，别一个个改它们。`pointerInput` 在 `androidx.compose.ui.input.pointer`，而手势检测器（`detectTapGestures` / `detectTransformGestures` / `detectDragGestures`）在 `androidx.compose.foundation.gestures` —— 两个包容易记混。pointerInput 解析不出来 ⇒ lambda 收不到 `PointerInputScope` 接收者 ⇒ 里面的成员/扩展全跟着报错。已踩过一次（全屏看图的双指缩放）。用 `impcheck.py` 先定位真正缺的那一个 |
 | 图标找不到 | 已引入 `material-icons-extended`，确认图标名与 `Outlined`/`Filled` 命名空间 |
+| `Cannot access 'companion object Companion: it is private in 'Foo'` | **companion 的可见性会连带限制它自己的成员**：`private companion object { val shared ... }` 里那个 `shared` 在别处一律访问不到（哪怕它自己没写 private）。要么把 companion 前的 `private` 去掉，要么把该成员挪出 companion。本项目 `AndroidKeystoreCredentialCipher.shared` 踩过；交付前用 `vischeck.py` 查 |
 | `rememberSaveable` 报 `Unresolved reference` | 包名是 `androidx.compose.runtime.saveable.rememberSaveable`（**不是** `runtime.rememberSaveable`）；写错会级联出一片 `Unresolved reference 'it'` / `@Composable invocations can only happen…`，别被后面的报错带偏 |
 | `animateColorAsState` 报 `Unresolved reference` | 包是 `androidx.compose.animation.animateColorAsState`（**不是** `androidx.compose.animation.core`）。判断依据：`.animation` 放的是**进出场/内容切换**（`AnimatedVisibility`/`AnimatedContent`/`fadeIn`/`fadeOut`/`slideInVertically`/`togetherWith`/`animateColorAsState`），`.animation.core` 放的是**时间曲线与动画值**（`tween`/`spring`/`Animatable`/`animateFloatAsState`/`animateDpAsState`）。写错包会连带一片 `Cannot infer type for this parameter`（`by` 委托推不出类型） |
 | Room 编译报 schema 错 | 检查 `version` 是否 +1、Migration 是否注册 |
